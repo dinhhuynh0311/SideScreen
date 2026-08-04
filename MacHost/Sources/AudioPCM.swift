@@ -1,5 +1,15 @@
 import Foundation
 
+/// The single definition of the audio wire format, shared by both capture
+/// sources so they cannot drift apart: the ScreenCaptureKit system tap
+/// (`ScreenCapture`) and the loopback-device path (`AudioDeviceCapture`).
+enum AudioWireFormat {
+    static let sampleRate = 48000
+    static let channelCount = 2
+    /// Signed 16-bit, so 2 bytes per sample × 2 channels.
+    static let bytesPerFrame = 4
+}
+
 /// Wire-format helpers for audio passthrough. Deliberately free of CoreMedia
 /// and Network.framework types so the conversion and framing can be unit
 /// tested without a live capture session.

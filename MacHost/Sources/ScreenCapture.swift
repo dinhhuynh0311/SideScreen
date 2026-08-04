@@ -350,8 +350,8 @@ class ScreenCapture {
         config.queueDepth = 4
         config.capturesAudio = captureAudio
         if captureAudio {
-            config.sampleRate = 48000
-            config.channelCount = 2
+            config.sampleRate = AudioWireFormat.sampleRate
+            config.channelCount = AudioWireFormat.channelCount
             // Without this the tap records our own stream back into itself.
             config.excludesCurrentProcessAudio = true
         }

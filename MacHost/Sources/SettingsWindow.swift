@@ -495,10 +495,36 @@ struct SettingsView: View {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Toggle("Mute Mac while streaming", isOn: $settings.muteMacWhileStreaming)
                                         .font(.system(size: 11))
-                                        .disabled(!settings.audioEnabled)
-                                    Text("Applies immediately. The Mac is muted only while a tablet is connected, and its previous volume comes back on disconnect.")
+                                        .disabled(!settings.audioEnabled || settings.usesAudioDeviceSource)
+                                    if settings.usesAudioDeviceSource {
+                                        Text("Not needed with a loopback device — the Mac's output already goes to the tablet, not its speakers.")
+                                            .font(.system(size: 10))
+                                            .foregroundColor(.orange)
+                                    } else {
+                                        Text("Applies immediately. The Mac is muted only while a tablet is connected, and its previous volume comes back on disconnect.")
+                                            .font(.system(size: 10))
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                                Divider()
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Source")
+                                        .font(.system(size: 11))
+                                        .foregroundColor(.secondary)
+                                    Picker("", selection: $settings.audioSourceDevice) {
+                                        Text("System audio (no driver needed)").tag("")
+                                        ForEach(settings.audioInputDeviceNames, id: \.self) { name in
+                                            Text(name).tag(name)
+                                        }
+                                    }
+                                    .labelsHidden()
+                                    .disabled(!settings.audioEnabled)
+                                    Text(settings.usesAudioDeviceSource
+                                        ? "Set this device as the Mac's output in Sound settings — or put it in a Multi-Output Device to hear the Mac too. Needs Microphone permission: macOS counts loopback drivers as microphones."
+                                        : "Captures the system mix. To make the tablet a selectable output device instead, install a loopback driver (brew install --cask blackhole-2ch) and pick it here.")
                                         .font(.system(size: 10))
                                         .foregroundColor(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
                                 }
                             }
                         }
@@ -1232,6 +1258,27 @@ class DisplaySettings: ObservableObject {
     @Published var muteMacWhileStreaming: Bool {
         didSet { save("muteMacWhileStreaming", muteMacWhileStreaming) }
     }
+    /// Empty string means the ScreenCaptureKit system tap. Any other value is
+    /// the localized name of an audio *input* device to capture from — normally
+    /// a loopback driver such as BlackHole, which makes the tablet behave as a
+    /// selectable macOS output device instead of a mirror of the system mix.
+    @Published var audioSourceDevice: String {
+        didSet { save("audioSourceDevice", audioSourceDevice) }
+    }
+
+    /// True when capturing from a loopback device rather than the system tap.
+    var usesAudioDeviceSource: Bool { !audioSourceDevice.isEmpty }
+
+    /// Audio input devices for the source picker, plus the currently-saved name
+    /// even if that device has since disappeared — otherwise the Picker would
+    /// silently fall back to the first tag and change the user's source.
+    var audioInputDeviceNames: [String] {
+        var names = AudioDeviceCapture.availableDevices().map(\.localizedName)
+        if usesAudioDeviceSource && !names.contains(audioSourceDevice) {
+            names.append(audioSourceDevice)
+        }
+        return names
+    }
 
     // Runtime state (not persisted)
     @Published var displayCreated = false
@@ -1280,6 +1327,8 @@ class DisplaySettings: ObservableObject {
         self.audioEnabled = defaults.object(forKey: keyPrefix + "audioEnabled") as? Bool ?? true
         self.muteMacWhileStreaming =
             defaults.object(forKey: keyPrefix + "muteMacWhileStreaming") as? Bool ?? true
+        // Defaults to the system tap, which needs no driver install.
+        self.audioSourceDevice = defaults.string(forKey: keyPrefix + "audioSourceDevice") ?? ""
 
         print("Loaded settings: \(resolution) @ \(refreshRate)Hz, bitrate=\(bitrate), quality=\(quality)")
     }
@@ -1350,7 +1399,7 @@ class DisplaySettings: ObservableObject {
         let keys = ["resolution", "refreshRate", "hiDPI", "bitrate", "quality",
                     "gamingBoost", "port", "rotation", "flipHorizontal", "flipVertical", "showAllResolutions",
                     "customWidth", "customHeight", "touchEnabled", "autoStartStreamingOnLaunch", "startupMode",
-                    "audioEnabled", "muteMacWhileStreaming"]
+                    "audioEnabled", "muteMacWhileStreaming", "audioSourceDevice"]
         for key in keys {
             defaults.removeObject(forKey: keyPrefix + key)
         }
@@ -1373,6 +1422,7 @@ class DisplaySettings: ObservableObject {
         startupMode = .usb
         audioEnabled = true
         muteMacWhileStreaming = true
+        audioSourceDevice = ""
 
         print("Settings reset to defaults")
     }

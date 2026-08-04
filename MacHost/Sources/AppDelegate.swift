@@ -65,6 +65,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// `previousMacMuteState` cannot be clobbered by a fast connect/disconnect
     /// cycle. All access to the two properties below happens on this queue.
     private let audioMuteQueue = DispatchQueue(label: "com.sidescreen.audioMute", qos: .utility)
+    /// Non-nil only while capturing from a loopback device instead of the SCK tap.
+    private var audioDeviceCapture: AudioDeviceCapture?
     /// Mute state before we changed it. nil means we could not read it — see
     /// `didMuteMac`, which is what actually decides whether we restore.
     private var previousMacMuteState: Bool?
@@ -299,6 +301,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 Task { @MainActor in
                     guard self.settings.isRunning else { return }
                     debugLog("Audio \(enabled ? "enabled" : "disabled") — restarting server")
+                    self.stopServer()
+                    await self.startServer()
+                }
+            }
+            .store(in: &cancellables)
+
+        // Switching source flips the SCK tap on or off, which is fixed when the
+        // SCStream is configured — so it needs the same restart as $audioEnabled.
+        settings.$audioSourceDevice
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] device in
+                guard let self = self else { return }
+                Task { @MainActor in
+                    guard self.settings.isRunning else { return }
+                    let label = device.isEmpty ? "system tap" : device
+                    debugLog("Audio source changed to \(label) — restarting server")
                     self.stopServer()
                     await self.startServer()
                 }
@@ -641,9 +660,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             // Must precede setupForVirtualDisplay — setupStream() reads this
             // property while configuring the SCStream, so setting it later is a
-            // silent no-op until the next restart.
-            screenCapture?.captureAudio = settings.audioEnabled
+            // silent no-op until the next restart. The SCK tap stays off when a
+            // loopback device is the source, so the two never both feed the wire.
+            screenCapture?.captureAudio = settings.audioEnabled && !settings.usesAudioDeviceSource
             try await screenCapture?.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
+            startAudioDeviceCaptureIfSelected()
 
             // Setup server
             streamingServer = StreamingServer(port: settings.port)
@@ -780,7 +801,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor
     private func muteMacForConnectedClient() {
         guard settings.audioEnabled, settings.muteMacWhileStreaming else { return }
+        // A loopback source already routes the Mac's output away from its
+        // speakers, so muting on top of it would only silence the tablet too.
+        guard !settings.usesAudioDeviceSource else { return }
         requestMuteMac()
+    }
+
+    /// Starts loopback-device capture when the settings select one, falling back
+    /// to leaving audio off rather than failing the whole server start — video is
+    /// the primary function and must survive an audio misconfiguration.
+    private func startAudioDeviceCaptureIfSelected() {
+        audioDeviceCapture?.stop()
+        audioDeviceCapture = nil
+        guard settings.audioEnabled, settings.usesAudioDeviceSource else { return }
+
+        let deviceName = settings.audioSourceDevice
+        AudioDeviceCapture.requestPermission { [weak self] granted in
+            guard let self = self else { return }
+            guard granted else {
+                debugLog("⚠️  Microphone permission denied — audio device capture unavailable. "
+                    + "Grant it in System Settings → Privacy & Security → Microphone.")
+                return
+            }
+            let capture = AudioDeviceCapture()
+            capture.onPCM = { [weak self] pcm in
+                self?.streamingServer?.sendAudio(pcm)
+            }
+            do {
+                try capture.start(deviceName: deviceName)
+                self.audioDeviceCapture = capture
+            } catch {
+                debugLog("⚠️  Audio device capture failed: \(error.localizedDescription)")
+            }
+        }
     }
 
     /// Non-isolated on purpose: dispatching from here rather than from the
@@ -847,6 +900,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Save display position before destroying
         virtualDisplayManager?.saveDisplayPosition()
 
+        audioDeviceCapture?.stop()
+        audioDeviceCapture = nil
         screenCapture?.stopStreaming()
         streamingServer?.stop()
         virtualDisplayManager?.destroyDisplay()

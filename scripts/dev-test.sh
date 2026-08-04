@@ -54,6 +54,8 @@ cat > "$APP_DIR/Contents/Info.plist" << EOF
     <true/>
     <key>NSScreenCaptureUsageDescription</key>
     <string>Side Screen needs screen recording access to capture your virtual display.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Side Screen needs microphone access to capture from a loopback audio device (macOS treats loopback drivers as microphones) so your Mac's audio can play on the tablet.</string>
 </dict>
 </plist>
 EOF
