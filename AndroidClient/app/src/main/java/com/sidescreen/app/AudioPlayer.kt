@@ -50,7 +50,16 @@ class AudioPlayer {
             return
         }
 
-        track =
+        // RuntimeException rather than named subclasses: build() declares
+        // UnsupportedOperationException ("Cannot create AudioTrack" — no free
+        // output track, or the low-latency config refused), and AOSP reaches it
+        // by converting an internal IllegalArgumentException, so the exact type
+        // is an implementation detail that has already changed once. Anything
+        // escaping here would unwind through play() and onAudioFrame into
+        // receiveData, whose only catch is IOException, tearing down the *video*
+        // stream over an audio fault. Catching the supertype keeps every failure
+        // inside the startFailed latch: audio goes quiet, video keeps streaming.
+        val built =
             try {
                 AudioTrack.Builder()
                     .setAudioAttributes(
@@ -68,18 +77,23 @@ class AudioPlayer {
                     .setBufferSizeInBytes(minBytes * 2)
                     .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                     .build()
-                    .also { it.play() }
-            } catch (e: IllegalStateException) {
-                Log.e(TAG, "AudioTrack creation failed", e)
-                null
-            } catch (e: IllegalArgumentException) {
-                Log.e(TAG, "AudioTrack rejected the format", e)
-                null
+            } catch (e: RuntimeException) {
+                Log.e(TAG, "AudioTrack creation failed (${e.javaClass.simpleName}) — audio disabled", e)
+                return
             }
 
-        if (track != null) {
-            Log.i(TAG, "AudioTrack started (buffer ${minBytes * 2} bytes)")
+        // Separate from build() so a play() failure still releases the native
+        // output track we just took, instead of leaking it until finalization.
+        try {
+            built.play()
+        } catch (e: RuntimeException) {
+            Log.e(TAG, "AudioTrack.play() failed (${e.javaClass.simpleName}) — audio disabled", e)
+            built.release()
+            return
         }
+
+        track = built
+        Log.i(TAG, "AudioTrack started (buffer ${minBytes * 2} bytes)")
     }
 
     @Synchronized
@@ -90,8 +104,14 @@ class AudioPlayer {
                 t.pause()
                 t.flush()
                 t.stop()
-            } catch (e: IllegalStateException) {
-                Log.w(TAG, "AudioTrack already stopped", e)
+            } catch (e: RuntimeException) {
+                // Same reasoning as start(): the usual case is a benign
+                // "already stopped" IllegalStateException, but stop() runs on
+                // the UI thread straight from the disconnect buttons with no
+                // try/catch above it, so letting an unexpected type escape
+                // would crash the app on a click. Swallowing also guarantees
+                // the release() below still runs.
+                Log.w(TAG, "AudioTrack teardown failed (${e.javaClass.simpleName})", e)
             }
             t.release()
         }
