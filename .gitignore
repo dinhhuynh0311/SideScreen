@@ -50,8 +50,12 @@ dist/
 .env.local
 *.pem
 
-# Docs (local design docs)
-docs/
+# Docs (local design docs). Matches direct children only, not `docs/`, so the
+# negation below can take effect — git cannot re-include anything under a
+# pruned directory.
+docs/*
+# ...except specs, which are versioned design history for this fork
+!docs/superpowers/
 
 # Temporary
 tmp/
