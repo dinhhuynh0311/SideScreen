@@ -64,7 +64,19 @@ echo "  OK"
 # 3. Build Android
 echo "[3/5] Building Android..."
 cd "$ROOT_DIR/AndroidClient"
-export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+# Same JDK lookup as build_android.sh — see the comment there.
+if [ -z "$JAVA_HOME" ] || [ ! -d "$JAVA_HOME" ]; then
+    for candidate in \
+        "/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
+        "/opt/homebrew/opt/openjdk@17" \
+        "/usr/local/opt/openjdk@17"
+    do
+        [ -d "$candidate" ] && export JAVA_HOME="$candidate" && break
+    done
+fi
+if [ -z "$ANDROID_HOME" ] && [ -d "/opt/homebrew/share/android-commandlinetools" ]; then
+    export ANDROID_HOME="/opt/homebrew/share/android-commandlinetools"
+fi
 ./gradlew assembleDebug -q
 APK="$ROOT_DIR/AndroidClient/app/build/outputs/apk/debug/app-debug.apk"
 echo "  OK"

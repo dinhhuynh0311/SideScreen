@@ -7,14 +7,33 @@ ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 echo "🔨 Building Android Client..."
 cd "$ROOT_DIR/AndroidClient"
 
-# Set JAVA_HOME for Android Studio's bundled JDK
-export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+# Find a JDK 17+: an explicit JAVA_HOME wins, then Android Studio's bundled JDK,
+# then Homebrew's openjdk@17. AGP 8.x rejects the Java 8 that macOS ships.
+if [ -z "$JAVA_HOME" ] || [ ! -d "$JAVA_HOME" ]; then
+    for candidate in \
+        "/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
+        "/opt/homebrew/opt/openjdk@17" \
+        "/usr/local/opt/openjdk@17"
+    do
+        if [ -d "$candidate" ]; then
+            export JAVA_HOME="$candidate"
+            break
+        fi
+    done
+fi
 
-# Check if Java is available
-if [ ! -d "$JAVA_HOME" ]; then
-    echo "❌ Java not found at: $JAVA_HOME"
-    echo "   Please install Android Studio or set JAVA_HOME manually"
+if [ -z "$JAVA_HOME" ] || [ ! -d "$JAVA_HOME" ]; then
+    echo "❌ No JDK 17+ found."
+    echo "   Install one with:  brew install openjdk@17"
+    echo "   Or set JAVA_HOME manually."
     exit 1
+fi
+echo "   Using JAVA_HOME=$JAVA_HOME"
+
+# The Android SDK location. Homebrew's command-line tools cask installs here;
+# local.properties (gitignored) may already point at it.
+if [ -z "$ANDROID_HOME" ] && [ -d "/opt/homebrew/share/android-commandlinetools" ]; then
+    export ANDROID_HOME="/opt/homebrew/share/android-commandlinetools"
 fi
 
 ./gradlew assembleDebug
