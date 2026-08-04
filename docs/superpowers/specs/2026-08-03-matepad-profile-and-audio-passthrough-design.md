@@ -176,12 +176,17 @@ PCM format: 48 kHz, 2 channels, signed 16-bit, interleaved, little-endian.
 - Convert SCK planar Float32 → interleaved Int16. Halves bandwidth versus
   Float32 and is inaudible for playback.
 
-**Mac — `AudioOutputMuter.swift` (new, small)**
+**Mac — `MacAudioMute.swift` (new, small)**
 
-- Resolve default output device via `kAudioHardwarePropertyDefaultOutputDevice`.
-- Mute with `kAudioDevicePropertyMute`; fall back to
-  `kAudioDevicePropertyVolumeScalar = 0` for devices that do not support mute.
-- Save prior state; restore on stream stop and on `applicationWillTerminate`.
+- Mute via `osascript -e 'set volume output muted true'`, read prior state via
+  `get volume settings`. Save prior state; restore on stream stop and on
+  `applicationWillTerminate`.
+- Chosen over CoreAudio `kAudioDevicePropertyMute` because it is 3 lines
+  instead of ~30, and `AppDelegate` already shells out to `adb`, so
+  subprocess use is an established pattern in this codebase. Ceiling: ~50 ms
+  per call, and it only ever touches the *default* output device. Upgrade path
+  to CoreAudio if per-device control is ever needed. Recorded as a `ponytail:`
+  comment at the call site.
 
 **Mac — `SettingsWindow.swift`**
 
@@ -201,7 +206,12 @@ PCM format: 48 kHz, 2 channels, signed 16-bit, interleaved, little-endian.
 - Written straight from the network receive thread. AudioTrack's own buffer
   is the jitter buffer — no ring buffer of ours.
 - No manifest permission required for playback.
-- Client sends type 12 during handshake only when the audio setting is on.
+- The client **always** advertises audio support (type 12); the host's own
+  toggle alone decides whether audio is actually sent. This keeps
+  configuration in one place — the Mac, where everything else is configured —
+  and removes an Android settings surface entirely. Tablet volume keys still
+  work on the AudioTrack. Same shape as codec negotiation: the client reports
+  capability, the host decides.
 
 ### Sequenced first: the mute/tap spike
 
