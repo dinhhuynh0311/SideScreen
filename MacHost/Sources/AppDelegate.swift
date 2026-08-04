@@ -57,9 +57,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Used to roll its `lastConnected` timestamp forward every status refresh tick so the UI
     /// shows "just now" while connected and freezes at the disconnect moment afterward.
     private var currentWirelessDevice: String?
-    /// Mute state before we changed it. nil means unknown or never changed —
-    /// in both cases we must not touch it on restore.
+    /// Mute state before we changed it. nil means we could not read it — see
+    /// `didMuteMac`, which is what actually decides whether we restore.
     private var previousMacMuteState: Bool?
+    /// True from the moment we call `setMuted(true)` until we have put it back.
+    /// Tracked separately from `previousMacMuteState` because the prior-state
+    /// read can fail (osascript failure returns nil); once we have muted the
+    /// device we own un-muting it regardless of what we knew going in.
+    private var didMuteMac = false
     private var cancellables = Set<AnyCancellable>()
     private var permissionCheckTimer: Timer?
     private var statusRefreshTimer: Timer?
@@ -696,6 +701,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if settings.audioEnabled && settings.muteMacWhileStreaming {
                 previousMacMuteState = MacAudioMute.isMuted()
                 MacAudioMute.setMuted(true)
+                didMuteMac = true
                 debugLog("Muted Mac output (was \(previousMacMuteState.map(String.init) ?? "unknown"))")
             }
 
@@ -705,6 +711,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             print("✅ Server started on port \(settings.port)")
         } catch {
+            // Nothing currently throws after the mute block, but a future
+            // reordering must not leave a muted Mac behind on a failed start.
+            restoreMacMuteState()
             print("❌ Failed to start: \(error)")
             await MainActor.run {
                 settings.isRunning = false
@@ -721,11 +730,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Puts the Mac's output mute back the way the user had it. First statement
     /// in every teardown path so a later throw can't leave the Mac silent.
+    ///
+    /// Gated on `didMuteMac`, not on `previousMacMuteState`: if the prior-state
+    /// read failed we still muted the device, so we still have to un-mute it.
+    /// Unknown prior state falls back to unmuted — the user can re-mute in one
+    /// keystroke, whereas a Mac left silently muted looks like broken hardware.
     private func restoreMacMuteState() {
-        guard let previous = previousMacMuteState else { return }
+        guard didMuteMac else { return }
+        let priorWasUnknown = previousMacMuteState == nil
+        let previous = previousMacMuteState ?? false
         MacAudioMute.setMuted(previous)
+        didMuteMac = false
         previousMacMuteState = nil
-        debugLog("Restored Mac output mute state to \(previous)")
+        debugLog("Restored Mac output mute state to \(previous)"
+            + (priorWasUnknown ? " (prior state was unknown)" : ""))
     }
 
     func stopServer() {
