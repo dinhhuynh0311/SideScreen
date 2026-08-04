@@ -213,16 +213,48 @@ PCM format: 48 kHz, 2 channels, signed 16-bit, interleaved, little-endian.
   work on the AudioTrack. Same shape as codec negotiation: the client reports
   capability, the host decides.
 
-### Sequenced first: the mute/tap spike
+### The mute/tap question — RESOLVED on hardware
 
-Before any of Part C is built, verify that SCK's audio tap still delivers
-non-silent samples while the default output device is muted. The tap is
-expected to sit ahead of the hardware device, but this is unverified and the
-whole "Mac goes silent" behaviour depends on it.
+The whole "Mac goes silent" behaviour depended on an unverified assumption: that
+SCK's audio tap sits ahead of the hardware output device, so muting the device
+does not silence the tap.
 
-If the tap sits behind device mute: drop the auto-mute, keep the "Mute Mac"
-toggle as a manual control, and ship mirror-only. Nothing else in Part C
-changes.
+The planned standalone spike was cut — a freshly built binary has no Screen
+Recording (TCC) permission, so it could not run headlessly. The question was
+answered instead by the end-to-end run on real hardware (M4 + MRDI-W09, USB):
+
+> **Verified: the tap survives device mute.** With `muteMacWhileStreaming` on and
+> the tablet connected, audio played from the **tablet only** and the Mac was
+> silent. Auto-mute works as designed, and `muteMacWhileStreaming` correctly
+> ships defaulting to on.
+
+The fallback that is therefore NOT needed, recorded for the future in case a
+different macOS version behaves differently: drop the auto-mute, keep the
+"Mute Mac" toggle as a manual control, and ship mirror-only. Nothing else in
+Part C would change.
+
+### Playback buffer sizing — corrected on hardware
+
+The original design assumed `2 × AudioTrack.getMinBufferSize` would land near
+40 ms. On the MatePad Pro 12.2 it does not: `getMinBufferSize` returns 5772
+frames (**120 ms**) against a 240-frame (**5 ms**) fast-mixer burst, so the 2×
+buffer was **240 ms** — audibly behind the video, confirmed by the measured run.
+
+The lag was measured as **constant, not growing**, which rules out clock drift
+between capture and playback; it was purely the oversized buffer.
+
+`AudioPlayer` now sizes the buffer from `AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER`
+— the unit the HAL actually consumes — targeting `TARGET_BUFFER_MS = 40`, rounded
+up to whole bursts (8 × 240 frames = 7680 bytes on this device). It falls back to
+the old `2 × getMinBufferSize` when the burst property is unavailable or the
+device rejects the smaller size, because working audio at higher latency beats no
+audio. `stop()` logs `underrunCount` so a device needing a larger target is
+diagnosable rather than merely crackly.
+
+Note the interaction with the shared-connection decision above: a 40 ms buffer
+still absorbs the ~10 ms a large keyframe can add ahead of an audio packet, which
+is what made the single-socket choice sound. A much smaller target would erode
+that margin.
 
 ### Accepted limitations
 

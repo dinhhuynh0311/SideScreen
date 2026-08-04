@@ -10,15 +10,27 @@ import android.util.Log
  * straight from the network receive thread.
  *
  * ponytail: AudioTrack's own buffer is the jitter buffer — there is
- * deliberately no ring buffer here. Buffer is 2x the device minimum, which is
- * enough to absorb the ~10ms a large video keyframe can add ahead of an audio
- * packet on the shared connection. Add a real jitter buffer only if dropouts
- * show up on WiFi.
+ * deliberately no ring buffer here. It is sized to [TARGET_BUFFER_MS], enough to
+ * absorb the ~10ms a large video keyframe can add ahead of an audio packet on
+ * the shared connection. Add a real jitter buffer only if dropouts show up on
+ * WiFi.
+ *
+ * Do NOT size it from `getMinBufferSize`: on the MatePad Pro 12.2 that returns
+ * 5772 frames (120ms) against a 240-frame (5ms) fast-mixer burst, and a 2x
+ * multiple of it put audio ~240ms behind the video — plainly audible. The
+ * device's native burst is the unit the HAL actually consumes, so a small
+ * multiple of that is the low-latency size.
+ *
+ * @param nativeBurstFrames AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER, or 0
+ *   when unavailable, in which case we fall back to the getMinBufferSize path.
  *
  * There is no A/V sync: audio plays as it arrives. Fine for music, calls, and
- * UI sound; may drift slightly against video.
+ * UI sound. Measured lag is constant rather than growing, so clock drift is not
+ * accumulating; revisit only if that changes.
  */
-class AudioPlayer {
+class AudioPlayer(
+    private val nativeBurstFrames: Int = 0,
+) {
     private var track: AudioTrack? = null
     private var startFailed = false
 
@@ -49,6 +61,7 @@ class AudioPlayer {
             Log.e(TAG, "getMinBufferSize returned $minBytes — audio playback unavailable")
             return
         }
+        val bufferBytes = preferredBufferBytes(minBytes)
 
         // RuntimeException rather than named subclasses: build() declares
         // UnsupportedOperationException ("Cannot create AudioTrack" — no free
@@ -74,11 +87,20 @@ class AudioPlayer {
                             .setChannelMask(CHANNEL_CONFIG)
                             .build(),
                     ).setTransferMode(AudioTrack.MODE_STREAM)
-                    .setBufferSizeInBytes(minBytes * 2)
+                    .setBufferSizeInBytes(bufferBytes)
                     .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
                     .build()
             } catch (e: RuntimeException) {
-                Log.e(TAG, "AudioTrack creation failed (${e.javaClass.simpleName}) — audio disabled", e)
+                // A burst-derived size is well above one HAL burst, so this
+                // should not be a size rejection — but if the device refuses it,
+                // working audio at higher latency beats no audio at all.
+                Log.w(
+                    TAG,
+                    "AudioTrack rejected a ${bufferBytes}-byte buffer (${e.javaClass.simpleName}) " +
+                        "— retrying at ${minBytes * 2}",
+                    e,
+                )
+                startAtFallbackSize(minBytes)
                 return
             }
 
@@ -93,13 +115,68 @@ class AudioPlayer {
         }
 
         track = built
-        Log.i(TAG, "AudioTrack started (buffer ${minBytes * 2} bytes)")
+        Log.i(
+            TAG,
+            "AudioTrack started (buffer $bufferBytes bytes ≈ ${bufferMs(bufferBytes)}ms, " +
+                "burst=$nativeBurstFrames frames, getMinBufferSize=$minBytes)",
+        )
+    }
+
+    /**
+     * Buffer size targeting [TARGET_BUFFER_MS], rounded up to a whole number of
+     * HAL bursts so the fast mixer is never handed a partial burst.
+     */
+    private fun preferredBufferBytes(minBytes: Int): Int {
+        if (nativeBurstFrames <= 0) return minBytes * 2
+        val burstBytes = nativeBurstFrames * BYTES_PER_FRAME
+        val targetBytes = SAMPLE_RATE * TARGET_BUFFER_MS / 1000 * BYTES_PER_FRAME
+        val bursts = ((targetBytes + burstBytes - 1) / burstBytes).coerceAtLeast(2)
+        return bursts * burstBytes
+    }
+
+    /** Last resort when the device rejects the burst-derived size. */
+    private fun startAtFallbackSize(minBytes: Int) {
+        val built =
+            try {
+                AudioTrack.Builder()
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                            .build(),
+                    ).setAudioFormat(
+                        AudioFormat.Builder()
+                            .setEncoding(ENCODING)
+                            .setSampleRate(SAMPLE_RATE)
+                            .setChannelMask(CHANNEL_CONFIG)
+                            .build(),
+                    ).setTransferMode(AudioTrack.MODE_STREAM)
+                    .setBufferSizeInBytes(minBytes * 2)
+                    .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                    .build()
+            } catch (e: RuntimeException) {
+                Log.e(TAG, "AudioTrack creation failed (${e.javaClass.simpleName}) — audio disabled", e)
+                return
+            }
+        try {
+            built.play()
+        } catch (e: RuntimeException) {
+            Log.e(TAG, "AudioTrack.play() failed (${e.javaClass.simpleName}) — audio disabled", e)
+            built.release()
+            return
+        }
+        track = built
+        Log.i(TAG, "AudioTrack started at fallback buffer ${minBytes * 2} bytes ≈ ${bufferMs(minBytes * 2)}ms")
     }
 
     @Synchronized
     fun stop() {
         startFailed = false
         track?.let { t ->
+            // Underruns are how we learn the buffer went too small on a device
+            // whose burst differs from the MatePad's. Non-zero here plus audible
+            // crackling means raise TARGET_BUFFER_MS.
+            Log.i(TAG, "AudioTrack stopping (underruns=${t.underrunCount})")
             try {
                 t.pause()
                 t.flush()
@@ -123,6 +200,19 @@ class AudioPlayer {
         const val SAMPLE_RATE = 48000
         const val CHANNEL_CONFIG = AudioFormat.CHANNEL_OUT_STEREO
         const val ENCODING = AudioFormat.ENCODING_PCM_16BIT
+
+        /** 2 channels x 16-bit. */
+        const val BYTES_PER_FRAME = 4
+
+        /**
+         * Playback buffer target. 40ms covers the ~10ms a large video keyframe
+         * can add ahead of an audio packet on the shared TCP connection, and sits
+         * close enough to the ~25ms video pipeline that the offset is not audible.
+         * Raise it if [stop] starts reporting underruns.
+         */
+        const val TARGET_BUFFER_MS = 40
+
+        fun bufferMs(bytes: Int): Int = bytes * 1000 / (SAMPLE_RATE * BYTES_PER_FRAME)
 
         /** 256 KB, about 1.4s of 48 kHz stereo — far above any real frame. */
         const val MAX_AUDIO_FRAME_SIZE = 1 shl 18

@@ -11,6 +11,7 @@ import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.graphics.drawable.ColorDrawable
 import android.hardware.usb.UsbManager
+import android.media.AudioManager
 import android.media.MediaFormat
 import android.os.Build
 import android.os.Bundle
@@ -51,7 +52,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: PreferencesManager
     private var videoDecoder: VideoDecoder? = null
     private var streamClient: StreamClient? = null
-    private val audioPlayer = AudioPlayer()
+    // `by lazy` because the AudioManager query needs an attached Context, which a
+    // field initializer does not have. First use is the first audio frame.
+    private val audioPlayer by lazy { AudioPlayer(nativeOutputBurstFrames()) }
     private var currentSurfaceHolder: SurfaceHolder? = null
     private var currentTextureSurface: Surface? = null
     private var decoderUsingTextureView = false
@@ -1295,6 +1298,19 @@ class MainActivity : AppCompatActivity() {
                 showError(errorMessage)
             }
         }
+    }
+
+    /**
+     * The device's native output burst in frames, or 0 when unavailable.
+     * AudioPlayer sizes its buffer from this rather than getMinBufferSize, which
+     * on this tablet reports 5772 frames (120ms) against a 240-frame burst.
+     */
+    private fun nativeOutputBurstFrames(): Int {
+        val manager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return 0
+        return manager
+            .getProperty(AudioManager.PROPERTY_OUTPUT_FRAMES_PER_BUFFER)
+            ?.toIntOrNull()
+            ?: 0
     }
 
     private fun disconnect() {
