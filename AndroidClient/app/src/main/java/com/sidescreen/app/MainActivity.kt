@@ -51,6 +51,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var prefs: PreferencesManager
     private var videoDecoder: VideoDecoder? = null
     private var streamClient: StreamClient? = null
+    private val audioPlayer = AudioPlayer()
     private var currentSurfaceHolder: SurfaceHolder? = null
     private var currentTextureSurface: Surface? = null
     private var decoderUsingTextureView = false
@@ -1028,6 +1029,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        streamClient?.onAudioFrame = { pcm, length ->
+            audioPlayer.play(pcm, length)
+        }
+
         streamClient?.onConnectionStatus = { connected ->
             runOnUiThread {
                 isConnected = connected
@@ -1175,6 +1180,10 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
+                streamClient?.onAudioFrame = { pcm, length ->
+                    audioPlayer.play(pcm, length)
+                }
+
                 streamClient?.onConnectionStatus = { connected ->
                     runOnUiThread {
                         // Update connection state flag
@@ -1291,6 +1300,10 @@ class MainActivity : AppCompatActivity() {
     private fun disconnect() {
         stopPingTimer()
         streamClient?.disconnect()
+        // Release the AudioTrack here rather than in cleanup(): cleanup() calls
+        // disconnect(), while the disconnect buttons call disconnect() directly,
+        // so this one call covers both paths and a reconnect starts a fresh track.
+        audioPlayer.stop()
         // Reset display config so next connect defers decoder init until config arrives
         displayWidth = 0
         displayHeight = 0

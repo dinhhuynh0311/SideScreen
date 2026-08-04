@@ -38,6 +38,9 @@ class StreamClient(
     /** Invoked when the server confirms the stream codec (true = HEVC). */
     var onCodecSelected: ((Boolean) -> Unit)? = null
 
+    /** Invoked on the receive thread with 48 kHz stereo PCM16 LE audio. */
+    var onAudioFrame: ((ByteArray, Int) -> Unit)? = null
+
     /** Stream codec for sync-frame parsing. HEVC unless the server says otherwise. */
     @Volatile var streamCodecIsHevc = true
         private set
@@ -128,6 +131,7 @@ class StreamClient(
                 codecNegotiated = false
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
+                advertiseAudioSupport() // Also before type 8, for the same reason
                 advertiseFrameMetadataSupport()
                 isConnected = true
                 lastKeyframeReceivedNs = 0L
@@ -257,6 +261,7 @@ class StreamClient(
                 codecNegotiated = false
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
+                advertiseAudioSupport() // Also before type 8, for the same reason
                 advertiseFrameMetadataSupport()
                 isConnected = true
                 diagLog("Wireless connected to $host:$port")
@@ -316,6 +321,14 @@ class StreamClient(
         }
     }
 
+    private fun advertiseAudioSupport() {
+        outputStream?.let { out ->
+            out.writeByte(MESSAGE_CLIENT_SUPPORTS_AUDIO)
+            out.flush()
+            diagLog("Advertised audio playback support")
+        }
+    }
+
     private suspend fun receiveData() =
         withContext(Dispatchers.IO) {
             val input = inputStream ?: return@withContext
@@ -359,6 +372,17 @@ class StreamClient(
                             codecNegotiated = true
                             diagLog("Server selected codec: ${if (streamCodecIsHevc) "HEVC" else "H.264"}")
                             onCodecSelected?.invoke(streamCodecIsHevc)
+                        }
+
+                        MESSAGE_AUDIO_FRAME -> {
+                            val size = input.readInt()
+                            if (!AudioPlayer.isValidAudioFrameSize(size)) {
+                                Log.e(TAG, "Invalid audio frame size $size — disconnecting")
+                                break
+                            }
+                            val buf = ByteArray(size)
+                            input.readFully(buf, 0, size)
+                            onAudioFrame?.invoke(buf, size)
                         }
 
                         else -> {
@@ -607,6 +631,8 @@ class StreamClient(
         private const val MESSAGE_CLIENT_AVC_ONLY = 9
         private const val MESSAGE_CODEC_SELECTED = 10
         private const val MESSAGE_CLIENT_DECODER_LIMITS = 11
+        private const val MESSAGE_CLIENT_SUPPORTS_AUDIO = 12
+        private const val MESSAGE_AUDIO_FRAME = 13
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 
