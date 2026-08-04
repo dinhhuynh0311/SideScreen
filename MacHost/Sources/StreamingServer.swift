@@ -21,6 +21,14 @@ private enum WireMessage {
     /// #41). Every payload byte has the high bit set, so old hosts that
     /// consume unknown types byte-by-byte skip the payload harmlessly.
     static let clientDecoderLimits: UInt8 = 11
+    /// Client→server, payload-free: "this device can play streamed audio".
+    /// Sent BEFORE type 8, like types 9 and 11, because type 8 can trigger the
+    /// server's early protocol finish.
+    static let clientSupportsAudio: UInt8 = 12
+    /// Server→client, `[length: 4 BE][pcm]`. 48 kHz stereo Int16 LE. Sent ONLY
+    /// to clients that sent clientSupportsAudio — old clients disconnect on
+    /// unknown message types, so this must never be sent unsolicited.
+    static let audioFrame: UInt8 = 13
 }
 
 private extension NWEndpoint {
@@ -66,6 +74,7 @@ class StreamingServer {
 
     private let frameQueue = DispatchQueue(label: "frameQueue", qos: .userInteractive)
     private let receiveQueue = DispatchQueue(label: "receiveQueue", qos: .userInteractive)
+    private let audioQueue = DispatchQueue(label: "audioSendQueue", qos: .userInitiated)
     private let networkQueue = DispatchQueue(label: "networkQueue", qos: .userInteractive)
     private var bytesSent: UInt64 = 0
     private var frameCount: UInt64 = 0
@@ -82,6 +91,7 @@ class StreamingServer {
     private var waitingForSyncFrame = false
     private var clientSupportsFrameMetadata = false
     private var clientIsAvcOnly = false
+    private var clientSupportsAudio = false
     /// Max decode size reported by the connected client (issue #41).
     private(set) var clientDecodeLimits: (width: Int, height: Int)?
     private var inputBuffer = Data()
@@ -136,6 +146,7 @@ class StreamingServer {
         connectionReady = false
         clientSupportsFrameMetadata = false
         clientIsAvcOnly = false
+        clientSupportsAudio = false
         clientDecodeLimits = nil
         waitingForSyncFrame = true
         inputBuffer.removeAll(keepingCapacity: true)
@@ -437,6 +448,14 @@ class StreamingServer {
                     debugLog("Client decoder limit: \(w)x\(h)")
                 }
 
+            case WireMessage.clientSupportsAudio:
+                // Payload-free opt-in, same convention as types 8 and 9.
+                consumeInputBytes(1)
+                if !clientSupportsAudio {
+                    clientSupportsAudio = true
+                    debugLog("Client supports audio passthrough")
+                }
+
             default:
                 debugLog("Unknown client input type: \(msgType)")
                 consumeInputBytes(1)
@@ -502,6 +521,20 @@ class StreamingServer {
             // Track frame age at send time for pipeline profiling
             let sendAge = DispatchTime.now().uptimeNanoseconds - timestamp
             self.updateStats(bytes: data.count, frameAgeNs: sendAge)
+        }
+    }
+
+    func sendAudio(_ pcm: Data) {
+        guard let connection = connection, !isStopped, connectionReady,
+              clientSupportsAudio, !pcm.isEmpty else { return }
+
+        // ponytail: audio shares the video TCP connection. A large keyframe
+        // ahead of an audio packet delays it ~10ms on USB (300KB at ~300Mbps),
+        // absorbed by the client's AudioTrack buffer. Give audio its own
+        // connection if dropouts show up on WiFi.
+        audioQueue.async {
+            let packet = AudioPCM.audioPacket(messageType: WireMessage.audioFrame, pcm: pcm)
+            connection.send(content: packet, completion: .contentProcessed { _ in })
         }
     }
 
@@ -573,6 +606,7 @@ class StreamingServer {
         // Wait for pending operations before cancelling
         frameQueue.sync {}
         receiveQueue.sync {}
+        audioQueue.sync {}
 
         connection?.cancel()
         listener?.cancel()

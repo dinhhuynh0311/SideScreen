@@ -82,6 +82,14 @@ class ScreenCapture {
     /// Callback when capture method changes (e.g. SCStream → CGDisplayStream fallback)
     var onCaptureMethodChanged: ((String) -> Void)?
 
+    /// Whether the SCK audio tap is enabled. Read by setupStream(), so it must
+    /// be set before setupForVirtualDisplay() and it survives restartStream() —
+    /// a parameter would not, and audio would die on codec renegotiation or wake.
+    var captureAudio: Bool = false
+    private let audioSampleQueue = DispatchQueue(label: "audioSampleQueue", qos: .userInitiated)
+    /// Set by AppDelegate to forward captured PCM to the streaming server.
+    var onAudioPCM: ((Data) -> Void)?
+
     /// Force the encoder to emit an IDR keyframe on the next frame.
     /// If the encoder hasn't been created yet (request arrived before
     /// startStreaming), the request is stored and applied at encoder init.
@@ -340,12 +348,22 @@ class ScreenCapture {
         config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         config.showsCursor = true
         config.queueDepth = 4
-        config.capturesAudio = false
+        config.capturesAudio = captureAudio
+        if captureAudio {
+            config.sampleRate = 48000
+            config.channelCount = 2
+            // Without this the tap records our own stream back into itself.
+            config.excludesCurrentProcessAudio = true
+        }
         config.backgroundColor = .clear
         config.scalesToFit = false
 
         let scStream = SCStream(filter: filter, configuration: config, delegate: delegate)
         try scStream.addStreamOutput(streamOutput!, type: .screen, sampleHandlerQueue: .global(qos: .userInteractive))
+        if captureAudio {
+            try scStream.addStreamOutput(streamOutput!, type: .audio,
+                                         sampleHandlerQueue: audioSampleQueue)
+        }
 
         stream = scStream
         debugLog("Stream configured: \(width)x\(height) @ \(fps)fps (with delegate)")
@@ -358,6 +376,14 @@ class ScreenCapture {
         encodeQueue = queue
         pendingEncodes = 0
         lastPixelBuffer = nil
+
+        streamOutput?.onAudioReceived = { [weak self] sampleBuffer in
+            guard let self = self,
+                  let channels = self.planarFloatChannels(from: sampleBuffer) else { return }
+            let pcm = AudioPCM.interleaveInt16(channels: channels)
+            guard !pcm.isEmpty else { return }
+            self.onAudioPCM?(pcm)
+        }
 
         streamOutput?.onFrameReceived = { [weak self] sampleBuffer in
             guard let self = self else { return }
@@ -398,6 +424,56 @@ class ScreenCapture {
                     self.encoder?.encode(pixelBuffer: cached, presentationTimeStamp: pts)
                     OSAtomicDecrement32(&self.pendingEncodes)
                 }
+            }
+        }
+    }
+
+    // MARK: - Audio extraction
+
+    /// Planar Float32 channels out of an SCK audio sample buffer.
+    ///
+    /// ponytail: allocates an array per channel per callback (~21ms at 48kHz,
+    /// 1024 frames). Measurable but trivial next to video encode. Convert
+    /// straight into a reused buffer if audio ever shows up in a profile.
+    private func planarFloatChannels(from sampleBuffer: CMSampleBuffer) -> [[Float]]? {
+        var listSize = 0
+        guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: &listSize,
+            bufferListOut: nil,
+            bufferListSize: 0,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: 0,
+            blockBufferOut: nil) == noErr else { return nil }
+
+        let raw = UnsafeMutableRawPointer.allocate(
+            byteCount: listSize,
+            alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { raw.deallocate() }
+        let listPtr = raw.assumingMemoryBound(to: AudioBufferList.self)
+
+        // blockBuffer must stay alive for as long as we read mData.
+        var blockBuffer: CMBlockBuffer?
+        guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: listPtr,
+            bufferListSize: listSize,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+            blockBufferOut: &blockBuffer) == noErr else { return nil }
+
+        // withExtendedLifetime rather than a bare `_ = blockBuffer`: ARC may
+        // release at last use, and a discard statement here would BE the last
+        // use — released before the mData reads it owns the memory for.
+        return withExtendedLifetime(blockBuffer) {
+            UnsafeMutableAudioBufferListPointer(listPtr).map { buffer -> [Float] in
+                guard let data = buffer.mData else { return [] }
+                let count = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
+                return Array(UnsafeBufferPointer(
+                    start: data.assumingMemoryBound(to: Float.self), count: count))
             }
         }
     }
@@ -809,9 +885,17 @@ class ScreenCapture {
 
 class StreamOutput: NSObject, SCStreamOutput {
     var onFrameReceived: ((CMSampleBuffer) -> Void)?
+    var onAudioReceived: ((CMSampleBuffer) -> Void)?
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen else { return }
-        onFrameReceived?(sampleBuffer)
+        switch type {
+        case .screen:
+            onFrameReceived?(sampleBuffer)
+        case .audio:
+            onAudioReceived?(sampleBuffer)
+        default:
+            // .microphone (macOS 15+) and any future types are not ours.
+            break
+        }
     }
 }
