@@ -9,7 +9,8 @@ import android.os.Process
 import android.util.Log
 import android.view.Display
 import android.view.Surface
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 
 private fun diagLog(msg: String) = DiagLog.log("VD", msg)
 
@@ -67,8 +68,10 @@ class VideoDecoder(
     private var stallReported = false
     private var queuedInputCount = 0L
 
-    // Available input buffer indices — fed by onInputBufferAvailable callback
-    private val availableInputBuffers = ConcurrentLinkedQueue<Int>()
+    // Available input buffer indices — fed by onInputBufferAvailable callback.
+    // Blocking queue rather than ConcurrentLinkedQueue so a caller can wait a
+    // bounded time for the pool to refill; see INPUT_BUFFER_WAIT_MS.
+    private val availableInputBuffers = LinkedBlockingQueue<Int>()
 
     init {
         setupDecoder()
@@ -341,15 +344,26 @@ class VideoDecoder(
         }
 
         // Direct feed: grab an available input buffer and queue immediately.
-        val index = availableInputBuffers.poll()
+        // A short wait first, because dropping a compressed frame is expensive:
+        // it breaks the P-frame reference chain and forces a keyframe, so a
+        // momentarily empty pool must not cost a whole GOP. The wait doubles as
+        // backpressure — it paces this thread to the decoder instead of
+        // overfeeding and then panicking.
+        //
+        // Measured on a MatePad Pro 12.2 at 2800x1840 under synthetic full-screen
+        // motion: 13 pool-exhaustion drops in 15s at 90Hz and many more at 120Hz
+        // before this wait; zero at both after. The cost is decoder latency,
+        // which rose from ~38ms at 90Hz to ~54-62ms at 120Hz as the wait absorbs
+        // the overfeed — still inside MAX_RENDER_LATENCY_NS, so nothing is
+        // discarded downstream.
+        val index = availableInputBuffers.poll(INPUT_BUFFER_WAIT_MS, TimeUnit.MILLISECONDS)
         if (index == null) {
-            // Decoder input pool exhausted (typically a WiFi burst saturating
-            // MediaCodec). Do NOT pause the pipeline — keep feeding so the
-            // cursor tracks live. Reference state diverges briefly (cursor
-            // trail visible), but a force-keyframe request bypasses every
-            // layer's throttle and rebuilds the reference within ~100-200 ms,
-            // which feels better than a 1-2 s freeze waiting on the next
-            // throttled request to land.
+            // Pool still empty after waiting. Do NOT pause the pipeline — keep
+            // feeding so the cursor tracks live. Reference state diverges
+            // briefly (cursor trail visible), but a force-keyframe request
+            // bypasses every layer's throttle and rebuilds the reference within
+            // ~100-200 ms, which feels better than a 1-2 s freeze waiting on
+            // the next throttled request to land.
             droppedFrames++
             if (droppedFrames <= 3L || droppedFrames % 60L == 0L) {
                 diagLog("Dropping frame (no input buffer, dropped=$droppedFrames)")
@@ -545,6 +559,17 @@ class VideoDecoder(
         private const val STALL_DETECT_INPUT_FRAMES = 120L
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 1_000_000_000L
         private const val FORCE_KEYFRAME_REQUEST_INTERVAL_NS = 200_000_000L
+        /**
+         * How long to wait for a MediaCodec input buffer before giving up and
+         * forcing a keyframe. Two frame intervals at 90Hz (~22ms), which covers
+         * the transient exhaustion measured on the MatePad Pro 12.2.
+         *
+         * ponytail: this blocks the network receive thread, which also carries
+         * audio — 20ms is inside the AudioPlayer's 40ms buffer, so a stall is
+         * absorbed rather than audible. Raising it much past that would trade
+         * video freezes for audio dropouts.
+         */
+        private const val INPUT_BUFFER_WAIT_MS = 20L
         private const val MAX_RENDER_LATENCY_NS = 100_000_000L
         private const val MAX_REASONABLE_LATENCY_NS = 2_000_000_000L
     }

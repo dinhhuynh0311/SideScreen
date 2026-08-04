@@ -79,6 +79,14 @@ class ScreenCapture {
     private var pendingEncodes: Int32 = 0
     private var lastPixelBuffer: CVPixelBuffer?
 
+    // Capture-stage instrumentation. The send-side "Pipeline:" stat cannot tell
+    // a capture stall (SCStream delivered nothing) apart from encoder
+    // backpressure (delivered, then silently discarded at pendingEncodes >= 2),
+    // and those have opposite fixes.
+    private var captureDeliveries: Int32 = 0
+    private var backpressureSkips: Int32 = 0
+    private var captureStatsTimer: DispatchSourceTimer?
+
     /// Callback when capture method changes (e.g. SCStream → CGDisplayStream fallback)
     var onCaptureMethodChanged: ((String) -> Void)?
 
@@ -404,10 +412,12 @@ class ScreenCapture {
             }
 
             let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            OSAtomicIncrement32(&self.captureDeliveries)
 
             // Backpressure: skip if encode queue already has 2+ frames pending
             let pending = OSAtomicAdd32(0, &self.pendingEncodes)
             if pending >= 2 {
+                OSAtomicIncrement32(&self.backpressureSkips)
                 return
             }
 
@@ -535,8 +545,26 @@ class ScreenCapture {
 
     // MARK: - Continuous frame-flow monitor
 
+    /// Logs capture-stage counters once a second so a capture stall can be told
+    /// apart from encoder backpressure.
+    private func startCaptureStats() {
+        captureStatsTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .utility))
+        timer.schedule(deadline: .now() + 1.0, repeating: 1.0)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            let delivered = OSAtomicAnd32Orig(0, &self.captureDeliveries)
+            let skipped = OSAtomicAnd32Orig(0, &self.backpressureSkips)
+            let pending = OSAtomicAdd32(0, &self.pendingEncodes)
+            debugLog("Capture: delivered=\(delivered), backpressureSkips=\(skipped), pendingEncodes=\(pending)")
+        }
+        timer.resume()
+        captureStatsTimer = timer
+    }
+
     private func startFrameMonitor() {
         stopFrameMonitor()
+        startCaptureStats()
 
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.main)
         timer.schedule(deadline: .now() + 3.0, repeating: 3.0)
