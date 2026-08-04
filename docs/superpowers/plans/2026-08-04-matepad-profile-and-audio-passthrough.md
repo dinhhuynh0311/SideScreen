@@ -445,7 +445,7 @@ wire packet. Kept free of CoreMedia types so both are unit-testable."
 Turns on the SCK audio tap, extracts PCM from the sample buffers, and adds the two wire message types. Audio is gated on the client having advertised support, exactly as `codecSelected` is.
 
 **Files:**
-- Modify: `MacHost/Sources/ScreenCapture.swift` (`configureStream` around :336-349, `StreamOutput` at :810-816, plus a new extraction helper and an audio queue)
+- Modify: `MacHost/Sources/ScreenCapture.swift` (`setupStream()` at :311-353, `configureFrameHandler` at :356, `StreamOutput` at :810-816, plus a new extraction helper, an audio queue, and a `captureAudio` property)
 - Modify: `MacHost/Sources/StreamingServer.swift` (`WireMessage` at :4-24, `handleConnection` at :136-141, `processInputBuffer` at :352-445, plus `sendAudio`)
 
 **Interfaces:**
@@ -453,7 +453,7 @@ Turns on the SCK audio tap, extracts PCM from the sample buffers, and adds the t
 - Produces:
   - `StreamingServer.sendAudio(_ pcm: Data)` — no-ops unless the client sent type 12 and the connection is ready.
   - `StreamOutput.onAudioReceived: ((CMSampleBuffer) -> Void)?`
-  - `ScreenCapture.configureStream(..., captureAudio: Bool)` — new trailing parameter, defaulting to `false` so existing call sites are unaffected.
+  - `ScreenCapture.captureAudio: Bool` — stored property, default `false`, read by `setupStream()`. Set by `AppDelegate` in Task 6 before `setupForVirtualDisplay`.
   - `ScreenCapture.onAudioPCM: ((Data) -> Void)?` — set by `AppDelegate` in Task 6.
 
 - [ ] **Step 1: Add the wire message types**
@@ -552,9 +552,18 @@ class StreamOutput: NSObject, SCStreamOutput {
 
 - [ ] **Step 4: Enable the audio tap in the stream configuration**
 
-In `ScreenCapture.swift`, change the `configureStream` signature to take a new trailing parameter. Find the declaration whose body contains `let config = SCStreamConfiguration()` (around :336) and add `captureAudio: Bool = false` as its last parameter.
+The `SCStreamConfiguration` block lives in `private func setupStream() async throws` at `ScreenCapture.swift:311`. It takes **no parameters** and is called from both `setupForVirtualDisplay` (:181) and `restartStream()` (:527), so `captureAudio` must be a **stored property**, not a threaded parameter — otherwise audio silently dies after any stream restart (codec renegotiation, display wake, capture fallback).
 
-Then replace `config.capturesAudio = false` with:
+Add the property to `ScreenCapture` alongside the other configuration state:
+
+```swift
+    /// Whether the SCK audio tap is enabled. Read by setupStream(), so it must
+    /// be set before setupForVirtualDisplay() and it survives restartStream() —
+    /// a parameter would not, and audio would die on codec renegotiation or wake.
+    var captureAudio: Bool = false
+```
+
+Then inside `setupStream()`, replace `config.capturesAudio = false` with:
 
 ```swift
         config.capturesAudio = captureAudio
@@ -566,7 +575,7 @@ Then replace `config.capturesAudio = false` with:
         }
 ```
 
-And after the existing `try scStream.addStreamOutput(streamOutput!, type: .screen, ...)` line, add:
+And after the existing `try scStream.addStreamOutput(streamOutput!, type: .screen, ...)` line (:348), add:
 
 ```swift
         if captureAudio {
@@ -839,7 +848,7 @@ Connects everything on the Mac: two persisted settings, the UI section, forwardi
 - Modify: `MacHost/Sources/AppDelegate.swift` (settings observers near :258-270, stream start near :577 and :662, stop path, `applicationWillTerminate`)
 
 **Interfaces:**
-- Consumes: `StreamingServer.sendAudio(_:)`, `ScreenCapture.onAudioPCM`, `ScreenCapture.configureStream(..., captureAudio:)` from Task 4; `MacAudioMute.isMuted()`, `MacAudioMute.setMuted(_:)` from Task 5.
+- Consumes: `StreamingServer.sendAudio(_:)`, `ScreenCapture.onAudioPCM`, `ScreenCapture.captureAudio` from Task 4; `MacAudioMute.isMuted()`, `MacAudioMute.setMuted(_:)` from Task 5.
 - Produces: `DisplaySettings.audioEnabled: Bool`, `DisplaySettings.muteMacWhileStreaming: Bool`.
 
 - [ ] **Step 1: Add the two settings**
@@ -937,11 +946,13 @@ In `AppDelegate.swift`, after `screenCapture = try await ScreenCapture()` (aroun
             }
 ```
 
-Pass the setting through at the point `configureStream` is called (find the call in the `startStreaming` path around :662 and add the argument):
+Set the capture flag **before** `setupForVirtualDisplay` runs, since `setupStream()` reads it during that call. Insert immediately after the `screenCapture?.onCaptureMethodChanged = { ... }` block and before `try await screenCapture?.setupForVirtualDisplay(...)` at `AppDelegate.swift:585`:
 
 ```swift
-                captureAudio: settings.audioEnabled
+            screenCapture?.captureAudio = settings.audioEnabled
 ```
+
+Do **not** add a `captureAudio` argument to the `startStreaming(...)` call at :662 — the flag is a property read by `setupStream()`, which has already run by then.
 
 Then, where streaming starts, save and apply mute:
 
