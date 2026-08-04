@@ -470,6 +470,20 @@ struct SettingsView: View {
                             }
                         }
 
+                        // Audio passthrough
+                        FrostedGroupBox(title: "Audio", icon: "speaker.wave.2") {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Toggle("Stream audio to tablet", isOn: $settings.audioEnabled)
+                                    .font(.system(size: 11))
+                                Toggle("Mute Mac while streaming", isOn: $settings.muteMacWhileStreaming)
+                                    .font(.system(size: 11))
+                                    .disabled(!settings.audioEnabled)
+                                Text("48 kHz stereo over the existing connection. Toggling restarts the stream.")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+
                         // Network Settings (port — applies to both modes; listener binds on it)
                         FrostedGroupBox(title: "Network Settings", icon: "network") {
                             VStack(alignment: .leading, spacing: 8) {
@@ -1193,6 +1207,12 @@ class DisplaySettings: ObservableObject {
     @Published var startupMode: ConnectionMode {
         didSet { save("startupMode", startupMode.rawValue) }
     }
+    @Published var audioEnabled: Bool {
+        didSet { save("audioEnabled", audioEnabled) }
+    }
+    @Published var muteMacWhileStreaming: Bool {
+        didSet { save("muteMacWhileStreaming", muteMacWhileStreaming) }
+    }
 
     // Runtime state (not persisted)
     @Published var displayCreated = false
@@ -1236,6 +1256,11 @@ class DisplaySettings: ObservableObject {
         self.autoStartStreamingOnLaunch = defaults.object(forKey: keyPrefix + "autoStartStreamingOnLaunch") as? Bool ?? false
         let startupRaw = defaults.string(forKey: keyPrefix + "startupMode") ?? modeRaw
         self.startupMode = ConnectionMode(rawValue: startupRaw) ?? .usb
+        // `object(forKey:) as? Bool` rather than `bool(forKey:)` so an absent
+        // key means "default on", not false.
+        self.audioEnabled = defaults.object(forKey: keyPrefix + "audioEnabled") as? Bool ?? true
+        self.muteMacWhileStreaming =
+            defaults.object(forKey: keyPrefix + "muteMacWhileStreaming") as? Bool ?? true
 
         print("Loaded settings: \(resolution) @ \(refreshRate)Hz, bitrate=\(bitrate), quality=\(quality)")
     }
@@ -1305,7 +1330,8 @@ class DisplaySettings: ObservableObject {
     func resetToDefaults() {
         let keys = ["resolution", "refreshRate", "hiDPI", "bitrate", "quality",
                     "gamingBoost", "port", "rotation", "flipHorizontal", "flipVertical", "showAllResolutions",
-                    "customWidth", "customHeight", "touchEnabled", "autoStartStreamingOnLaunch", "startupMode"]
+                    "customWidth", "customHeight", "touchEnabled", "autoStartStreamingOnLaunch", "startupMode",
+                    "audioEnabled", "muteMacWhileStreaming"]
         for key in keys {
             defaults.removeObject(forKey: keyPrefix + key)
         }
@@ -1326,6 +1352,8 @@ class DisplaySettings: ObservableObject {
         touchEnabled = true
         autoStartStreamingOnLaunch = false
         startupMode = .usb
+        audioEnabled = true
+        muteMacWhileStreaming = true
 
         print("Settings reset to defaults")
     }

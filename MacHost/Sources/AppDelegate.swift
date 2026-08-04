@@ -57,6 +57,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Used to roll its `lastConnected` timestamp forward every status refresh tick so the UI
     /// shows "just now" while connected and freezes at the disconnect moment afterward.
     private var currentWirelessDevice: String?
+    /// Mute state before we changed it. nil means unknown or never changed —
+    /// in both cases we must not touch it on restore.
+    private var previousMacMuteState: Bool?
     private var cancellables = Set<AnyCancellable>()
     private var permissionCheckTimer: Timer?
     private var statusRefreshTimer: Timer?
@@ -267,6 +270,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 Task { @MainActor in
                     guard self.settings.isRunning else { return }
                     debugLog("Resolution changed to \(resolution) — restarting server to rebuild virtual display")
+                    self.stopServer()
+                    await self.startServer()
+                }
+            }
+            .store(in: &cancellables)
+
+        // capturesAudio is set when the stream is configured, so toggling audio
+        // needs the same stop/start cycle the resolution observer performs.
+        settings.$audioEnabled
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] enabled in
+                guard let self = self else { return }
+                Task { @MainActor in
+                    guard self.settings.isRunning else { return }
+                    debugLog("Audio \(enabled ? "enabled" : "disabled") — restarting server")
                     self.stopServer()
                     await self.startServer()
                 }
@@ -582,6 +601,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self.settings.captureMethod = method
                 }
             }
+            screenCapture?.onAudioPCM = { [weak self] pcm in
+                self?.streamingServer?.sendAudio(pcm)
+            }
+            // Must precede setupForVirtualDisplay — setupStream() reads this
+            // property while configuring the SCStream, so setting it later is a
+            // silent no-op until the next restart.
+            screenCapture?.captureAudio = settings.audioEnabled
             try await screenCapture?.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
 
             // Setup server
@@ -667,6 +693,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 frameRate: settings.effectiveRefreshRate
             )
 
+            if settings.audioEnabled && settings.muteMacWhileStreaming {
+                previousMacMuteState = MacAudioMute.isMuted()
+                MacAudioMute.setMuted(true)
+                debugLog("Muted Mac output (was \(previousMacMuteState.map(String.init) ?? "unknown"))")
+            }
+
             await MainActor.run {
                 settings.isRunning = true
             }
@@ -687,7 +719,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Puts the Mac's output mute back the way the user had it. First statement
+    /// in every teardown path so a later throw can't leave the Mac silent.
+    private func restoreMacMuteState() {
+        guard let previous = previousMacMuteState else { return }
+        MacAudioMute.setMuted(previous)
+        previousMacMuteState = nil
+        debugLog("Restored Mac output mute state to \(previous)")
+    }
+
     func stopServer() {
+        restoreMacMuteState()
+
         // Save display position before destroying
         virtualDisplayManager?.saveDisplayPosition()
 
@@ -1097,6 +1140,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // First, so a quit never leaves the Mac muted even if teardown throws.
+        restoreMacMuteState()
+
         // Stop momentum scrolling
         stopMomentumScroll()
 
