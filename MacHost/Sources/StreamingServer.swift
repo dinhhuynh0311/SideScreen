@@ -91,7 +91,13 @@ class StreamingServer {
     private var waitingForSyncFrame = false
     private var clientSupportsFrameMetadata = false
     private var clientIsAvcOnly = false
-    private var clientSupportsAudio = false
+    /// The connection that sent clientSupportsAudio (type 12), or nil. Held as
+    /// an identity rather than a Bool on purpose: a reconnect rewrites
+    /// `connection` and the capability state as plain stores with no release
+    /// fence, so a reader on the audio queue can see the new connection next to
+    /// stale capability flags. Comparing identities fails closed in that window
+    /// — see sendAudio.
+    private var audioClient: NWConnection?
     /// Max decode size reported by the connected client (issue #41).
     private(set) var clientDecodeLimits: (width: Int, height: Int)?
     private var inputBuffer = Data()
@@ -146,7 +152,7 @@ class StreamingServer {
         connectionReady = false
         clientSupportsFrameMetadata = false
         clientIsAvcOnly = false
-        clientSupportsAudio = false
+        audioClient = nil
         clientDecodeLimits = nil
         waitingForSyncFrame = true
         inputBuffer.removeAll(keepingCapacity: true)
@@ -450,9 +456,11 @@ class StreamingServer {
 
             case WireMessage.clientSupportsAudio:
                 // Payload-free opt-in, same convention as types 8 and 9.
+                // Recorded as this exact connection, not a flag, so a type 13
+                // can never be routed to a later client that did not opt in.
                 consumeInputBytes(1)
-                if !clientSupportsAudio {
-                    clientSupportsAudio = true
+                if audioClient !== connection {
+                    audioClient = connection
                     debugLog("Client supports audio passthrough")
                 }
 
@@ -525,8 +533,16 @@ class StreamingServer {
     }
 
     func sendAudio(_ pcm: Data) {
+        // Identity check, not a capability Bool: this runs on the audio queue
+        // while handleConnection rewrites `connection` and the capability state
+        // as plain stores with no release fence. A reader can therefore observe
+        // the NEW connection alongside the previous client's stale flags, and a
+        // stale `true` would emit type 13 to a client that never sent type 12 —
+        // which disconnects it. Requiring `connection === audioClient` fails
+        // closed instead: a stale audioClient cannot match the new connection,
+        // so type 13 only ever reaches the exact connection that opted in.
         guard let connection = connection, !isStopped, connectionReady,
-              clientSupportsAudio, !pcm.isEmpty else { return }
+              connection === audioClient, !pcm.isEmpty else { return }
 
         // ponytail: audio shares the video TCP connection. A large keyframe
         // ahead of an audio packet delays it ~10ms on USB (300KB at ~300Mbps),
@@ -611,6 +627,7 @@ class StreamingServer {
         connection?.cancel()
         listener?.cancel()
         connection = nil
+        audioClient = nil
         listener = nil
     }
 }
