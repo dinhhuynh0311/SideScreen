@@ -85,9 +85,13 @@ Enable HiDPI mode to render at 2× resolution internally — text and icons are 
 
 Enable Gaming Boost for optimized settings: 1 Gbps bitrate, ultra-low latency encoding, 120 FPS.
 
+### Audio Passthrough
+
+System audio follows the picture: the Mac's output is captured and played on the tablet, and the Mac itself is muted while the tablet is connected so you hear one set of speakers, not two. Both behaviours are on by default and can be switched off independently in Settings → Audio.
+
 ### Customizable
 
-Configure resolution (up to 4K/8K), frame rate (30–120 FPS), bitrate (20–5000 Mbps), and quality presets from the Mac app.
+Configure resolution (up to 4K/8K), frame rate (30–144 FPS), bitrate (20–5000 Mbps), and quality presets from the Mac app.
 
 <div align="center">
   <img src="resources/screenshots/mac_settings_1.png" alt="macOS Settings — Display & FPS" height="500"/>
@@ -191,12 +195,16 @@ First-time setup still needs a screen once to grant Screen Recording permission;
 | Setting | Options | Default |
 |---------|---------|---------|
 | Resolution | 720p to 8K, 30+ presets + custom | 1920x1200 |
-| Frame Rate | 30, 60, 90, 120 FPS | 120 |
+| Frame Rate | 30, 60, 90, 120, 144 FPS | 120 |
 | Bitrate | 20–5000 Mbps | 1000 Mbps |
 | Quality | Ultra Low, Low, Medium, High | Ultra Low |
 | HiDPI (Retina) | On/Off | Off |
 | Gaming Boost | On/Off (1 Gbps, 120 Hz) | Off |
 | Touch Input | On/Off | On |
+| Stream Audio to Tablet | On/Off | On |
+| Mute Mac While Streaming | On/Off | On |
+
+The Mac is muted only while a tablet is connected, and its previous volume is restored as soon as the tablet disconnects or you quit.
 
 ---
 

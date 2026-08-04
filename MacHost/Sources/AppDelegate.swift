@@ -57,6 +57,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Used to roll its `lastConnected` timestamp forward every status refresh tick so the UI
     /// shows "just now" while connected and freezes at the disconnect moment afterward.
     private var currentWirelessDevice: String?
+    /// Serial queue owning every mute/restore transition. Two reasons it exists:
+    /// `MacAudioMute` shells out to osascript (~50ms per call) and the connect /
+    /// disconnect callbacks that drive it arrive on the server's network queue,
+    /// which must not stall for that long; and being serial it guarantees a
+    /// read-prior-state/mute pair can never interleave with a restore, so
+    /// `previousMacMuteState` cannot be clobbered by a fast connect/disconnect
+    /// cycle. All access to the two properties below happens on this queue.
+    private let audioMuteQueue = DispatchQueue(label: "com.sidescreen.audioMute", qos: .utility)
     /// Mute state before we changed it. nil means we could not read it — see
     /// `didMuteMac`, which is what actually decides whether we restore.
     private var previousMacMuteState: Bool?
@@ -293,6 +301,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     debugLog("Audio \(enabled ? "enabled" : "disabled") — restarting server")
                     self.stopServer()
                     await self.startServer()
+                }
+            }
+            .store(in: &cancellables)
+
+        // Muting is not stream configuration — it needs no restart, just an
+        // immediate mute/restore so the checkbox can never disagree with the
+        // Mac's actual output state. Un-checking while muted un-mutes now
+        // instead of leaving the Mac silent for the rest of the session.
+        settings.$muteMacWhileStreaming
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] enabled in
+                guard let self = self else { return }
+                Task { @MainActor in
+                    if enabled {
+                        // Only takes effect if a tablet is actually connected —
+                        // same rule as onClientConnected.
+                        guard self.settings.clientConnected else { return }
+                        self.muteMacForConnectedClient()
+                    } else {
+                        self.requestRestoreMacMuteState()
+                    }
                 }
             }
             .store(in: &cancellables)
@@ -641,6 +671,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
                 Task { @MainActor in
                     self.settings.clientConnected = true
+                    // The tablet is now the speaker — silence the Mac's own
+                    // output for as long as it is here.
+                    self.muteMacForConnectedClient()
                 }
             }
             // Runs synchronously on the server's network queue BEFORE the
@@ -666,6 +699,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self = self else { return }
                 Task { @MainActor in
                     self.settings.clientConnected = false
+                    // Tablet gone → the Mac is the speaker again. Idempotent,
+                    // which matters: this callback fires for both .failed and
+                    // .cancelled. Hopping through the main actor like the mute
+                    // side does keeps the two ordered relative to each other,
+                    // so a reconnect can't have its mute overtaken by the
+                    // previous connection's restore.
+                    self.requestRestoreMacMuteState()
                     // Final lastConnected snapshot at the disconnect moment, then
                     // freeze (currentWirelessDevice = nil stops the rolling update
                     // in refreshStatusIndicators).
@@ -698,12 +738,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 frameRate: settings.effectiveRefreshRate
             )
 
-            if settings.audioEnabled && settings.muteMacWhileStreaming {
-                previousMacMuteState = MacAudioMute.isMuted()
-                MacAudioMute.setMuted(true)
-                didMuteMac = true
-                debugLog("Muted Mac output (was \(previousMacMuteState.map(String.init) ?? "unknown"))")
-            }
+            // Muting deliberately does NOT happen here: the server outlives the
+            // client, so mute is bound to the client's lifetime instead — see
+            // onClientConnected / onClientDisconnected above.
 
             await MainActor.run {
                 settings.isRunning = true
@@ -711,8 +748,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             print("✅ Server started on port \(settings.port)")
         } catch {
-            // Nothing currently throws after the mute block, but a future
-            // reordering must not leave a muted Mac behind on a failed start.
+            // A failed start can't normally have muted anything (mute happens on
+            // client connect), but this is cheap and a partially-started server
+            // may already have accepted a client.
             restoreMacMuteState()
             print("❌ Failed to start: \(error)")
             await MainActor.run {
@@ -728,14 +766,71 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Puts the Mac's output mute back the way the user had it. First statement
-    /// in every teardown path so a later throw can't leave the Mac silent.
+    // MARK: - Mac mute lifecycle
+    //
+    // The tablet is the speaker *while the tablet is there*: we mute on client
+    // connect and restore on client disconnect, not on server start/stop. The
+    // server deliberately outlives the client, so tying mute to the server left
+    // a Mac silent with no tablet in the room (worst case: auto-start at login).
+    // stopServer()/applicationWillTerminate() still restore as a backstop.
+
+    /// Mutes the Mac for the connected tablet, if the settings ask for it.
+    /// Main-actor so the `settings` reads are on the thread that publishes them;
+    /// the osascript work itself hops to `audioMuteQueue`.
+    @MainActor
+    private func muteMacForConnectedClient() {
+        guard settings.audioEnabled, settings.muteMacWhileStreaming else { return }
+        requestMuteMac()
+    }
+
+    /// Non-isolated on purpose: dispatching from here rather than from the
+    /// main-actor caller keeps the closure out of a cross-isolation hop.
+    private func requestMuteMac() {
+        audioMuteQueue.async { [weak self] in
+            self?.muteMacOnQueue()
+        }
+    }
+
+    /// Restores asynchronously. Safe to call when we never muted — it no-ops.
+    private func requestRestoreMacMuteState() {
+        audioMuteQueue.async { [weak self] in
+            self?.restoreMacMuteStateOnQueue()
+        }
+    }
+
+    /// Synchronous restore for teardown paths (stop / quit), where the process
+    /// or the server may be gone before an async block would run. First
+    /// statement in every teardown path so a later throw can't leave the Mac
+    /// silent. `audioMuteQueue` never dispatches back to the caller's thread, so
+    /// this cannot deadlock.
+    private func restoreMacMuteState() {
+        audioMuteQueue.sync {
+            restoreMacMuteStateOnQueue()
+        }
+    }
+
+    /// Must run on `audioMuteQueue`.
+    ///
+    /// The `didMuteMac` guard makes a second mute a no-op: a duplicate connect
+    /// callback must not re-read the prior state, because by then the prior
+    /// state is our own `true` and we would restore to muted forever.
+    private func muteMacOnQueue() {
+        guard !didMuteMac else { return }
+        previousMacMuteState = MacAudioMute.isMuted()
+        MacAudioMute.setMuted(true)
+        didMuteMac = true
+        debugLog("Muted Mac output (was \(previousMacMuteState.map(String.init) ?? "unknown"))")
+    }
+
+    /// Must run on `audioMuteQueue`.
     ///
     /// Gated on `didMuteMac`, not on `previousMacMuteState`: if the prior-state
     /// read failed we still muted the device, so we still have to un-mute it.
+    /// The same guard makes repeat restores no-ops, which matters because
+    /// `onClientDisconnected` fires for both `.failed` and `.cancelled`.
     /// Unknown prior state falls back to unmuted — the user can re-mute in one
     /// keystroke, whereas a Mac left silently muted looks like broken hardware.
-    private func restoreMacMuteState() {
+    private func restoreMacMuteStateOnQueue() {
         guard didMuteMac else { return }
         let priorWasUnknown = previousMacMuteState == nil
         let previous = previousMacMuteState ?? false

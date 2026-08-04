@@ -421,7 +421,11 @@ struct SettingsView: View {
                                         .font(.system(size: 11))
                                         .foregroundColor(.secondary)
                                     Spacer()
-                                    Text("\(settings.refreshRate) Hz")
+                                    // Effective, not raw: Gaming Boost pins the
+                                    // stream to 120 Hz, and the header is the
+                                    // one place that must state what is
+                                    // actually being streamed.
+                                    Text("\(settings.effectiveRefreshRate) Hz")
                                         .font(.system(size: 11, weight: .medium))
                                 }
 
@@ -431,14 +435,22 @@ struct SettingsView: View {
                                             label: "\(rate)",
                                             value: rate,
                                             currentValue: settings.refreshRate,
-                                            disabled: false
+                                            disabled: settings.gamingBoost
                                         ) {
                                             settings.refreshRate = rate
                                         }
                                     }
                                 }
 
-                                if settings.refreshRate >= 90 {
+                                if settings.gamingBoost {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "bolt.fill")
+                                            .font(.system(size: 10))
+                                        Text("Locked at 120 Hz in Gaming Boost")
+                                            .font(.system(size: 10))
+                                    }
+                                    .foregroundColor(.orange)
+                                } else if settings.refreshRate >= 90 {
                                     Text("High refresh rate for smooth experience")
                                         .font(.system(size: 10))
                                         .foregroundColor(.green)
@@ -473,14 +485,21 @@ struct SettingsView: View {
                         // Audio passthrough
                         FrostedGroupBox(title: "Audio", icon: "speaker.wave.2") {
                             VStack(alignment: .leading, spacing: 8) {
-                                Toggle("Stream audio to tablet", isOn: $settings.audioEnabled)
-                                    .font(.system(size: 11))
-                                Toggle("Mute Mac while streaming", isOn: $settings.muteMacWhileStreaming)
-                                    .font(.system(size: 11))
-                                    .disabled(!settings.audioEnabled)
-                                Text("48 kHz stereo over the existing connection. Toggling restarts the stream.")
-                                    .font(.system(size: 10))
-                                    .foregroundColor(.secondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Toggle("Stream audio to tablet", isOn: $settings.audioEnabled)
+                                        .font(.system(size: 11))
+                                    Text("48 kHz stereo over the existing connection. Switching this restarts the server, so the tablet reconnects.")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary)
+                                }
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Toggle("Mute Mac while streaming", isOn: $settings.muteMacWhileStreaming)
+                                        .font(.system(size: 11))
+                                        .disabled(!settings.audioEnabled)
+                                    Text("Applies immediately. The Mac is muted only while a tablet is connected, and its previous volume comes back on disconnect.")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary)
+                                }
                             }
                         }
 
