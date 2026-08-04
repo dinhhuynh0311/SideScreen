@@ -120,187 +120,22 @@ the panel reports 1840)."
 
 ---
 
-### Task 2: Spike — does the SCK audio tap survive output-device mute?
+### Task 2: (removed) — spike folded into Task 8
 
-The entire "Mac goes silent, tablet is the speaker" behaviour rests on one unverified assumption: that ScreenCaptureKit's audio tap sits *ahead* of the hardware output device, so muting the device does not silence the tap. This task answers that before any production code depends on it.
+The standalone SCK-tap-versus-mute spike was cut before execution. A freshly
+built binary has no Screen Recording (TCC) permission — only the installed
+`SideScreen.app` does — so the spike could not run without a GUI permission
+prompt, and its sole output was the default value of one setting.
 
-This is a throwaway spike. Nothing here gets committed to the repo.
+That answer arrives naturally in **Task 8 Step 2**, which already documents
+both branches: if sound comes from both Mac and tablet, the tap does not
+survive device mute and `muteMacWhileStreaming` flips to default off.
 
-**Files:**
-- Create (scratchpad, not the repo): `/private/tmp/claude-501/-Users-huynhquocdinh-dev-personal-SideScreen/4c03b6cf-0d43-4cf8-84fc-a993d06883f2/scratchpad/audiospike/main.swift` and `Package.swift`
-- Modify: `docs/superpowers/specs/2026-08-03-matepad-profile-and-audio-passthrough-design.md` (record the finding)
+**Decision applied to the remaining tasks:** `muteMacWhileStreaming` defaults
+to **on** (Task 6 Step 1 uses `?? true`).
 
-**Interfaces:**
-- Consumes: nothing.
-- Produces: a recorded yes/no that sets the default value of `muteMacWhileStreaming` in Task 6. No code.
-
-- [ ] **Step 1: Create the spike package**
-
-```bash
-SPIKE=/private/tmp/claude-501/-Users-huynhquocdinh-dev-personal-SideScreen/4c03b6cf-0d43-4cf8-84fc-a993d06883f2/scratchpad/audiospike
-mkdir -p "$SPIKE/Sources/audiospike"
-cat > "$SPIKE/Package.swift" <<'EOF'
-// swift-tools-version: 5.9
-import PackageDescription
-
-let package = Package(
-    name: "audiospike",
-    platforms: [.macOS(.v13)],
-    targets: [.executableTarget(name: "audiospike", path: "Sources/audiospike")]
-)
-EOF
-```
-
-- [ ] **Step 2: Write the spike**
-
-Create `$SPIKE/Sources/audiospike/main.swift`:
-
-```swift
-import Foundation
-import ScreenCaptureKit
-import CoreMedia
-import AVFoundation
-
-// Prints the RMS of captured system audio once per second. Run it while sound
-// is playing, then mute the Mac and watch whether RMS collapses to zero.
-final class Probe: NSObject, SCStreamOutput, SCStreamDelegate {
-    private var sum: Double = 0
-    private var count: Int = 0
-
-    func stream(_ stream: SCStream, didOutputSampleBuffer sb: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .audio else { return }
-        var size = 0
-        guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sb, bufferListSizeNeededOut: &size, bufferListOut: nil, bufferListSize: 0,
-            blockBufferAllocator: nil, blockBufferMemoryAllocator: nil, flags: 0,
-            blockBufferOut: nil) == noErr else { return }
-        let raw = UnsafeMutableRawPointer.allocate(
-            byteCount: size, alignment: MemoryLayout<AudioBufferList>.alignment)
-        defer { raw.deallocate() }
-        let abl = raw.assumingMemoryBound(to: AudioBufferList.self)
-        var block: CMBlockBuffer?
-        guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            sb, bufferListSizeNeededOut: nil, bufferListOut: abl, bufferListSize: size,
-            blockBufferAllocator: nil, blockBufferMemoryAllocator: nil,
-            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
-            blockBufferOut: &block) == noErr else { return }
-        for buf in UnsafeMutableAudioBufferListPointer(abl) {
-            guard let data = buf.mData else { continue }
-            let n = Int(buf.mDataByteSize) / MemoryLayout<Float>.size
-            let p = data.assumingMemoryBound(to: Float.self)
-            for i in 0..<n { sum += Double(p[i] * p[i]); count += 1 }
-        }
-    }
-
-    func report() {
-        let rms = count > 0 ? (sum / Double(count)).squareRoot() : 0
-        let muted = (try? shell("get volume settings")) ?? "?"
-        print(String(format: "RMS %.6f  samples %d  | %@", rms, count, muted.trimmingCharacters(in: .whitespacesAndNewlines)))
-        sum = 0; count = 0
-    }
-
-    func stream(_ stream: SCStream, didStopWithError error: Error) {
-        print("stream stopped: \(error)")
-    }
-}
-
-func shell(_ script: String) throws -> String {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-    p.arguments = ["-e", script]
-    let pipe = Pipe()
-    p.standardOutput = pipe
-    try p.run()
-    let d = pipe.fileHandleForReading.readDataToEndOfFile()
-    p.waitUntilExit()
-    return String(data: d, encoding: .utf8) ?? ""
-}
-
-let probe = Probe()
-Task {
-    do {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        guard let display = content.displays.first else { fatalError("no display") }
-        let config = SCStreamConfiguration()
-        config.capturesAudio = true
-        config.sampleRate = 48000
-        config.channelCount = 2
-        config.excludesCurrentProcessAudio = true
-        config.width = 640
-        config.height = 480
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 5)
-        let stream = SCStream(
-            filter: SCContentFilter(display: display, excludingWindows: []),
-            configuration: config, delegate: probe)
-        try stream.addStreamOutput(probe, type: .audio, sampleHandlerQueue: .global())
-        try stream.addStreamOutput(probe, type: .screen, sampleHandlerQueue: .global())
-        try await stream.startCapture()
-        print("capturing — play audio now")
-    } catch {
-        print("setup failed: \(error)"); exit(1)
-    }
-}
-Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in probe.report() }
-RunLoop.main.run()
-```
-
-- [ ] **Step 3: Start looping audio, then run the spike unmuted**
-
-In one shell, start continuous sound:
-
-```bash
-while :; do afplay /System/Library/Sounds/Submarine.aiff; done
-```
-
-In another, unmute and run the probe for ~8 seconds:
-
-```bash
-osascript -e 'set volume output muted false'
-cd "$SPIKE" && timeout 8 swift run audiospike
-```
-
-Expected: `output muted:false` and **non-zero** RMS (roughly 0.001-0.2 depending on volume). If RMS is 0.000000 here, audio is not reaching the tap at all — check System Settings → Privacy & Security → Screen Recording for the terminal, and that the `afplay` loop is audible.
-
-- [ ] **Step 4: Run the spike muted — this is the actual question**
-
-```bash
-cd "$SPIKE" && (sleep 4; osascript -e 'set volume output muted true') & timeout 9 swift run audiospike; osascript -e 'set volume output muted false'
-```
-
-Expected if the assumption holds: RMS stays non-zero after the `output muted:true` line appears.
-Expected if it does not: RMS collapses to `0.000000` once muted.
-
-- [ ] **Step 5: Record the finding in the spec**
-
-Edit the "Sequenced first: the mute/tap spike" section of `docs/superpowers/specs/2026-08-03-matepad-profile-and-audio-passthrough-design.md`, replacing the paragraph beginning "Before any of Part C is built" with the measured outcome. Use one of these two, verbatim, matching what you observed:
-
-If the tap survived mute:
-
-```markdown
-**Spike result (verified):** The SCK audio tap continues to deliver non-silent
-samples while the default output device is muted — RMS stayed non-zero after
-`set volume output muted true`. Auto-mute is therefore viable, and
-`muteMacWhileStreaming` defaults to **on**.
-```
-
-If the tap went silent:
-
-```markdown
-**Spike result (verified):** The SCK audio tap goes silent when the default
-output device is muted — RMS collapsed to zero after
-`set volume output muted true`. Auto-mute is NOT viable. Ship mirror-only:
-audio plays on both Mac and tablet, `muteMacWhileStreaming` defaults to
-**off** and is a manual control the user drives knowing it silences the
-tablet too.
-```
-
-- [ ] **Step 6: Clean up the spike and commit the finding**
-
-```bash
-rm -rf "$SPIKE"
-git add docs/superpowers/specs/2026-08-03-matepad-profile-and-audio-passthrough-design.md
-git commit -m "docs: record SCK audio tap vs output-device mute spike result"
-```
+Task numbering is left unchanged so commit messages and ledger entries stay
+aligned with the committed plan.
 
 ---
 
@@ -874,7 +709,7 @@ In the initialiser alongside the other `defaults` reads:
             defaults.object(forKey: keyPrefix + "muteMacWhileStreaming") as? Bool ?? true
 ```
 
-**If the Task 2 spike found the tap goes silent when muted**, use `?? false` for `muteMacWhileStreaming` instead of `?? true`, and use `false` in `resetToDefaults` below.
+Use `?? true` for both, as written above. (Task 2's spike was cut; if Task 8's hardware run later shows the tap dies under device mute, this single default flips to `?? false` then — no other code changes.)
 
 In `resetToDefaults`, add both keys to the `keys` array:
 
@@ -1355,7 +1190,7 @@ Play audio on the Mac (`afplay /System/Library/Sounds/Submarine.aiff`).
 
 Expected: sound comes from the **tablet**, the Mac is silent, and the tablet's resolution overlay reads `1400x920`.
 
-If sound comes from both, the Task 2 spike found the tap dies under mute and `muteMacWhileStreaming` defaults off — that is the documented fallback, not a bug.
+**This step is where the cut spike's question gets answered.** If sound comes from the tablet only, the SCK tap survives device mute and the shipped default (`muteMacWhileStreaming` on) is correct. If sound comes from **both**, the tap does not survive mute: change the two `?? true` defaults for `muteMacWhileStreaming` in `SettingsWindow.swift` to `?? false`, set it to `false` in `resetToDefaults`, and record the finding in the spec. That is the documented fallback, not a bug.
 
 - [ ] **Step 3: Confirm mute restores cleanly**
 
@@ -1435,4 +1270,4 @@ Measured on M4 + MRDI-W09 at 2800x1840 HiDPI rather than assumed."
 
 **Host symbol names verified against source**, not assumed: `settings.isRunning` (not `isServerRunning`), `stopServer()` + `await startServer()` (there is no `restartServer()`), `cancellables`, and the already-present `applicationWillTerminate(_:)` at `AppDelegate.swift:1099`. Client sites verified too: two `advertise*` blocks, two `onConnectionStatus` handlers, two callback-assignment sites, and `cleanup()` as the teardown point.
 
-**One cross-task dependency to respect:** Task 2's spike result decides the default value of `muteMacWhileStreaming` in Task 6 Step 1 and the expected outcome in Task 8 Step 2. Both places state both branches explicitly.
+**Execution note (added at dispatch time):** Task 2's standalone spike was cut — a fresh binary has no Screen Recording permission, so it could not run headlessly, and its only output was one default value. `muteMacWhileStreaming` ships defaulting to on; Task 8 Step 2 answers the question on real hardware and names the exact one-line change if the answer is no.
