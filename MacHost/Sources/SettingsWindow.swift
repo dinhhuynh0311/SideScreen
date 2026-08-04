@@ -426,7 +426,7 @@ struct SettingsView: View {
                                 }
 
                                 HStack(spacing: 6) {
-                                    ForEach([30, 60, 90, 120], id: \.self) { rate in
+                                    ForEach([30, 60, 90, 120, 144], id: \.self) { rate in
                                         BitrateButton(
                                             label: "\(rate)",
                                             value: rate,
@@ -1252,6 +1252,12 @@ class DisplaySettings: ObservableObject {
     }
 
     static let resolutionGroups: [ResolutionGroup] = [
+        // Panel-native for the MatePad Pro 12.2" (MRDI-W09): 2800x1840 measured,
+        // not the 2800x1864 published spec. HiDPI doubles this logical size to
+        // land exactly on the panel, so nothing resamples.
+        ResolutionGroup(name: "MatePad Pro 12.2", ratio: "HiDPI 2800×1840", resolutions: [
+            "1400x920"
+        ]),
         ResolutionGroup(name: "16:10", ratio: "Widescreen", resolutions: [
             "1280x800", "1440x900", "1680x1050", "1920x1200", "2560x1600"
         ]),
