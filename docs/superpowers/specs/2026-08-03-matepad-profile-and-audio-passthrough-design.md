@@ -113,6 +113,50 @@ Manual precondition: HarmonyOS display settings must be pinned to 144 Hz, not
 Then a bitrate / `quality` / GOP pass at the winning rate, verified with the
 same two readouts.
 
+### Results — measured on hardware
+
+Load for every figure below: identical 18 s synthetic full-screen motion,
+auto-targeted at the virtual display. **A hardcoded window position is not
+usable for this** — when the arrangement shifts the window lands on the Mac's
+own monitor, the capture is then an idle desktop (~1.3 Mbps instead of ~5), and
+the run looks like a *faster* pipeline. That silently confounded one comparison
+before the tool was fixed to locate the display by logical size.
+
+Two measurable stages, both already instrumented: host `avg frame age`, which is
+`encode()` entry → socket write (i.e. essentially encode time, since the
+timestamp is stamped on entry), and the client's receive → decoded figure.
+
+At 2800×1840 HiDPI, 90 Hz, quality `high`:
+
+| Change | Host encode→send | Client receive→decoded | Worst case |
+|---|---|---|---|
+| Baseline | ~21 ms | **~31 ms** | 46–57 ms |
+| Decoder latency hints kept | ~21 ms | **~22 ms** | 46–48 ms |
+| Keyframe interval 1 s → 5 s | ~21 ms | ~22 ms | **38.9 ms max, 32.2 ms median** |
+
+**Frame rate does not trade against latency.** 60 Hz measured 33 ms against
+90 Hz's 30 ms — latency here is fixed in *time*, not in frames, so lowering the
+rate gains nothing and costs smoothness. 90 Hz is the right choice: the hardware
+HEVC decoder does ~550 Mpixel/s (258 fps @1080p, 71 fps @4K from
+`/vendor/etc/media_codecs_performance.xml`), 90 Hz asks 427 Mpixel/s (~78%), and
+120 Hz asks 618 Mpixel/s — over the ceiling, which is why 120 Hz measured
+54–62 ms.
+
+**Latency scales with pixel count, ~10 ms fixed + ~3.9 ms per megapixel.** Fitted
+from two points and confirmed under controlled load — turning HiDPI off (1400×920
+encoded, ¼ the pixels) gives host 21 → **7.4 ms**, client 22 → **10.7 ms**,
+keyframes 46 → **18 ms**. That is the largest single lever available, but the
+tablet then upscales to its 2800×1840 panel, so it is a sharpness/latency
+tradeoff for the user rather than a default.
+
+**Ruled out by measurement, recorded so they are not retried:**
+
+- **`quality`** — `high` 19.5 ms vs `medium` 19.9 ms client-side. No effect on
+  latency; it only moves bitrate.
+- **`INPUT_BUFFER_WAIT_MS`** (the 20 ms decoder input-buffer wait) — contributes
+  **0.1 ms**. It looks like an obvious latency suspect and is not one; the split
+  between pool wait and codec time is logged precisely so this stays visible.
+
 ## Part C — Audio passthrough
 
 ### Approach
