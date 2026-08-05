@@ -39,6 +39,10 @@ class VideoDecoder(
     // is queuing frames internally (compose/present can't keep up downstream),
     // which surfaces to the user as input lag on the captured display.
     private var latencySumNs: Long = 0
+    private var inputWaitSumNs: Long = 0
+    private var inputWaitSamples: Long = 0
+    private var keyframeLatencySumNs: Long = 0
+    private var keyframeLatencySamples: Long = 0
     private var latencySamples: Int = 0
     private var latencyMaxNs: Long = 0
 
@@ -141,72 +145,7 @@ class VideoDecoder(
             }
         codec.setCallback(callback, decoderHandler)
 
-        val format =
-            MediaFormat.createVideoFormat(
-                mime,
-                currentWidth,
-                currentHeight,
-            )
-
-        var configured = false
-
-        // Attempt 1: Full low-latency config
-        try {
-            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-            format.setInteger(MediaFormat.KEY_PRIORITY, 0)
-            format.setInteger(MediaFormat.KEY_OPERATING_RATE, displayRefreshRate.toInt())
-            format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-            codec.configure(format, surface, null, 0)
-            configured = true
-            diagLog("Configured with full low-latency")
-        } catch (e: Exception) {
-            diagLog("Full low-latency config failed: ${e.message}")
-            codec.reset()
-            codec.setCallback(callback, decoderHandler)
-        }
-
-        // Attempt 2: Without KEY_LOW_LATENCY
-        if (!configured) {
-            try {
-                val basicFormat =
-                    MediaFormat.createVideoFormat(
-                        mime,
-                        currentWidth,
-                        currentHeight,
-                    )
-                basicFormat.setInteger(MediaFormat.KEY_PRIORITY, 0)
-                basicFormat.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-                codec.configure(basicFormat, surface, null, 0)
-                configured = true
-                diagLog("Configured with basic format")
-            } catch (e: Exception) {
-                diagLog("Basic config failed: ${e.message}")
-                codec.reset()
-                codec.setCallback(callback, decoderHandler)
-            }
-        }
-
-        // Attempt 3: Minimal config (just resolution)
-        if (!configured) {
-            try {
-                val minimalFormat =
-                    MediaFormat.createVideoFormat(
-                        mime,
-                        currentWidth,
-                        currentHeight,
-                    )
-                codec.configure(minimalFormat, surface, null, 0)
-                diagLog("Configured with minimal format")
-            } catch (e: Exception) {
-                diagLog("All configure attempts failed: ${e.message}")
-                Log.e(TAG, "All configure attempts failed", e)
-                codec.release()
-                decoderThread?.quitSafely()
-                decoderThread = null
-                decoderHandler = null
-                throw e
-            }
-        }
+        configureWithBestSupportedHints(codec, mime, surface, callback)
 
         codec.setVideoScalingMode(MediaCodec.VIDEO_SCALING_MODE_SCALE_TO_FIT)
         needsKeyframe = true
@@ -217,6 +156,101 @@ class VideoDecoder(
             "Decoder started: ${currentWidth}x$currentHeight @ ${displayRefreshRate}Hz, " +
                 "surface=$surface, valid=${surface.isValid}",
         )
+    }
+
+    /**
+     * Configures [codec] with as many latency hints as it will accept, dropping
+     * the least valuable one at a time until `configure` succeeds.
+     *
+     * This used to be three fixed attempts: all four hints, then none of them,
+     * then bare resolution. On the MatePad Pro 12.2 the first attempt fails with
+     * OMX error 0x80001001, so the decoder ran with **no** latency hints at all.
+     * Measured cause: this OMX decoder rejects `KEY_LOW_LATENCY` itself — that
+     * one unsupported key was costing us every other hint too.
+     *
+     * So each hint is probed on its own first, and only the accepted ones are
+     * combined. Dropping from one end of a fixed order is not enough: whichever
+     * end `KEY_LOW_LATENCY` sits at, it would either be dropped first (losing a
+     * hint that works elsewhere) or last (losing everything behind it, which is
+     * exactly the bug).
+     *
+     * `KEY_MAX_B_FRAMES` is gone entirely: it is an encoder key, and the Mac
+     * already disables frame reordering, so it bought nothing and could only be
+     * a reason to fail.
+     */
+    private fun configureWithBestSupportedHints(
+        codec: MediaCodec,
+        mime: String,
+        surface: Surface,
+        callback: MediaCodec.Callback,
+    ) {
+        val hints: List<Pair<String, (MediaFormat) -> Unit>> =
+            listOf(
+                "lowLatency" to { f -> f.setInteger(MediaFormat.KEY_LOW_LATENCY, 1) },
+                "priority" to { f -> f.setInteger(MediaFormat.KEY_PRIORITY, 0) },
+                // Ask the codec to run flat out rather than pace itself to the
+                // stream rate; Short.MAX_VALUE is the documented "as fast as
+                // possible" value.
+                "operatingRate" to { f -> f.setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt()) },
+            )
+
+        // Probe individually, then narrow the accepted set if the combination is
+        // refused even though each part was fine.
+        val accepted =
+            hints.filter {
+                tryConfigure(codec, mime, surface, callback, listOf(it), keepConfiguration = false) != null
+            }
+        for (count in accepted.size downTo 0) {
+            val names = tryConfigure(codec, mime, surface, callback, accepted.take(count), keepConfiguration = true)
+            if (names != null) {
+                diagLog("Configured with latency hints: $names")
+                return
+            }
+        }
+
+        // Even bare resolution was refused — nothing left to try.
+        val failure = IllegalStateException("MediaCodec refused every configuration for $mime")
+        Log.e(TAG, "All configure attempts failed", failure)
+        codec.release()
+        decoderThread?.quitSafely()
+        decoderThread = null
+        decoderHandler = null
+        throw failure
+    }
+
+    /**
+     * Attempts one configuration, returning the applied hint names on success
+     * and null on rejection. Always leaves [codec] usable: a failed configure
+     * needs a reset, and reset drops the callback with it.
+     *
+     * @param keepConfiguration false while probing — a configured codec refuses
+     *   the next `configure`, so a successful probe has to be undone or every
+     *   later probe would look rejected.
+     */
+    private fun tryConfigure(
+        codec: MediaCodec,
+        mime: String,
+        surface: Surface,
+        callback: MediaCodec.Callback,
+        hints: List<Pair<String, (MediaFormat) -> Unit>>,
+        keepConfiguration: Boolean,
+    ): String? {
+        val format = MediaFormat.createVideoFormat(mime, currentWidth, currentHeight)
+        hints.forEach { (_, apply) -> apply(format) }
+        val names = if (hints.isEmpty()) "none" else hints.joinToString("+") { it.first }
+        return try {
+            codec.configure(format, surface, null, 0)
+            if (!keepConfiguration) {
+                codec.reset()
+                codec.setCallback(callback, decoderHandler)
+            }
+            names
+        } catch (e: Exception) {
+            diagLog("Configure rejected [$names]: ${e.message}")
+            codec.reset()
+            codec.setCallback(callback, decoderHandler)
+            null
+        }
     }
 
     /**
@@ -356,7 +390,13 @@ class VideoDecoder(
         // which rose from ~38ms at 90Hz to ~54-62ms at 120Hz as the wait absorbs
         // the overfeed — still inside MAX_RENDER_LATENCY_NS, so nothing is
         // discarded downstream.
+        val waitStartNs = System.nanoTime()
         val index = availableInputBuffers.poll(INPUT_BUFFER_WAIT_MS, TimeUnit.MILLISECONDS)
+        // Split out the pool wait: the total receive-to-decoded figure lumps it
+        // together with the codec's own pipeline, and the two have completely
+        // different fixes.
+        inputWaitSumNs += System.nanoTime() - waitStartNs
+        inputWaitSamples++
         if (index == null) {
             // Pool still empty after waiting. Do NOT pause the pipeline — keep
             // feeding so the cursor tracks live. Reference state diverges
@@ -465,17 +505,41 @@ class VideoDecoder(
                 latencySumNs += latencyNs
                 latencySamples++
                 if (latencyNs > latencyMaxNs) latencyMaxNs = latencyNs
+                // Keyframes are an order of magnitude larger than P-frames, so
+                // they are the obvious suspect for the max being ~1.6x the
+                // average. Tracked separately to confirm that before changing
+                // the encoder's keyframe interval on a hunch.
+                if (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0) {
+                    keyframeLatencySumNs += latencyNs
+                    keyframeLatencySamples++
+                }
             }
 
             if (outputFrameCount % 60L == 0L) {
                 val avgMs = if (latencySamples > 0) latencySumNs / latencySamples / 1_000_000.0 else 0.0
                 val maxMs = latencyMaxNs / 1_000_000.0
                 val inBufs = availableInputBuffers.size
+                // The total is receive-to-decoded. Subtracting the pool wait
+                // leaves the codec's own pipeline, which is the part no amount of
+                // feeding discipline can shorten.
+                val waitMs = if (inputWaitSamples > 0) inputWaitSumNs / inputWaitSamples / 1_000_000.0 else 0.0
+                val keyframeAvgMs =
+                    if (keyframeLatencySamples > 0) {
+                        keyframeLatencySumNs / keyframeLatencySamples / 1_000_000.0
+                    } else {
+                        0.0
+                    }
                 diagLog(
                     "Output #$outputFrameCount: decoder latency avg=${"%.1f".format(avgMs)}ms " +
-                        "max=${"%.1f".format(maxMs)}ms over $latencySamples samples, " +
+                        "max=${"%.1f".format(maxMs)}ms over $latencySamples samples " +
+                        "(poolWait=${"%.1f".format(waitMs)}ms, codec=${"%.1f".format(avgMs - waitMs)}ms, " +
+                        "keyframes=${"%.1f".format(keyframeAvgMs)}ms x$keyframeLatencySamples), " +
                         "input bufs avail=$inBufs, dropped=$droppedFrames",
                 )
+                inputWaitSumNs = 0
+                inputWaitSamples = 0
+                keyframeLatencySumNs = 0
+                keyframeLatencySamples = 0
                 latencySumNs = 0
                 latencySamples = 0
                 latencyMaxNs = 0
