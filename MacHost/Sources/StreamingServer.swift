@@ -541,8 +541,20 @@ class StreamingServer {
         // which disconnects it. Requiring `connection === audioClient` fails
         // closed instead: a stale audioClient cannot match the new connection,
         // so type 13 only ever reaches the exact connection that opted in.
-        guard let connection = connection, !isStopped, connectionReady,
-              connection === audioClient, !pcm.isEmpty else { return }
+        guard let connection = connection, !isStopped, connectionReady else {
+            noteAudioDrop("no ready connection")
+            return
+        }
+        guard connection === audioClient else {
+            noteAudioDrop("client has not opted in (no type 12)")
+            return
+        }
+        guard !pcm.isEmpty else {
+            noteAudioDrop("empty buffer")
+            return
+        }
+        audioSentBytes += pcm.count
+        reportAudioStatsIfDue()
 
         // ponytail: audio shares the video TCP connection. A large keyframe
         // ahead of an audio packet delays it ~10ms on USB (300KB at ~300Mbps),
@@ -583,6 +595,35 @@ class StreamingServer {
     // Pipeline profiling: track frame age at send time
     private var totalFrameAgeNs: UInt64 = 0
     private var profiledFrameCount: UInt64 = 0
+
+    // Audio accounting, diagnostics only. Every counter here is touched solely
+    // from the capture callback — the AVCaptureSession sample queue for a
+    // loopback device, ScreenCapture's tap queue for the SCK path, one serial
+    // queue either way — so no locking. Deliberately separate from
+    // `updateStats`, which only runs when video frames are being sent: audio
+    // silence has to stay visible even if video stalls.
+    private var audioSentBytes = 0
+    private var audioDropCount = 0
+    private var audioDropReason: String?
+    private var lastAudioStatsTime = DispatchTime.now()
+
+    private func noteAudioDrop(_ reason: String) {
+        audioDropCount += 1
+        audioDropReason = reason
+        reportAudioStatsIfDue()
+    }
+
+    private func reportAudioStatsIfDue() {
+        let now = DispatchTime.now()
+        let elapsed = Double(now.uptimeNanoseconds - lastAudioStatsTime.uptimeNanoseconds) / 1_000_000_000
+        guard elapsed >= 1.0 else { return }
+        let drops = audioDropCount > 0 ? ", dropped=\(audioDropCount) (\(audioDropReason ?? "?"))" : ""
+        debugLog("🔊 AudioWire: sent=\(audioSentBytes) bytes\(drops)")
+        audioSentBytes = 0
+        audioDropCount = 0
+        audioDropReason = nil
+        lastAudioStatsTime = now
+    }
 
     private func updateStats(bytes: Int, frameAgeNs: UInt64 = 0) {
         bytesSent += UInt64(bytes)

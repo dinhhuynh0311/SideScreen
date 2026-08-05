@@ -34,6 +34,11 @@ class AudioPlayer(
     private var track: AudioTrack? = null
     private var startFailed = false
 
+    // Stats state, only ever touched inside the synchronized play()/stop().
+    private var statBytes = 0
+    private var lastHead = 0
+    private var lastStatNs = 0L
+
     /**
      * Writes PCM, starting the track on first use. Synchronized against
      * [stop] because writes come from the network thread while teardown comes
@@ -52,7 +57,31 @@ class AudioPlayer(
                 return
             }
         }
-        track?.write(pcm, 0, length, AudioTrack.WRITE_BLOCKING)
+        val written = track?.write(pcm, 0, length, AudioTrack.WRITE_BLOCKING) ?: return
+        logStats(written)
+    }
+
+    /**
+     * Once a second: bytes accepted by [AudioTrack.write] against how far the
+     * playback head actually moved. Those two disagreeing is the whole
+     * diagnostic — bytes accepted with a stalled head means the track is wedged
+     * or routed to nothing, while both advancing means audio is genuinely
+     * playing and any silence is upstream of this device.
+     */
+    private fun logStats(written: Int) {
+        val t = track ?: return
+        statBytes += written
+        val now = System.nanoTime()
+        if (now - lastStatNs < 1_000_000_000L) return
+        val head = t.playbackHeadPosition
+        Log.i(
+            TAG,
+            "stats: wrote=$statBytes bytes (${statBytes / BYTES_PER_FRAME} frames), " +
+                "headAdvanced=${head - lastHead} frames, underruns=${t.underrunCount}",
+        )
+        statBytes = 0
+        lastHead = head
+        lastStatNs = now
     }
 
     private fun start() {
@@ -115,6 +144,10 @@ class AudioPlayer(
         }
 
         track = built
+        // A fresh track's playback head restarts at 0, so the baseline must too.
+        statBytes = 0
+        lastHead = 0
+        lastStatNs = System.nanoTime()
         Log.i(
             TAG,
             "AudioTrack started (buffer $bufferBytes bytes ≈ ${bufferMs(bufferBytes)}ms, " +
@@ -166,6 +199,10 @@ class AudioPlayer(
             return
         }
         track = built
+        // A fresh track's playback head restarts at 0, so the baseline must too.
+        statBytes = 0
+        lastHead = 0
+        lastStatNs = System.nanoTime()
         Log.i(TAG, "AudioTrack started at fallback buffer ${minBytes * 2} bytes ≈ ${bufferMs(minBytes * 2)}ms")
     }
 

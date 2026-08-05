@@ -256,6 +256,52 @@ still absorbs the ~10 ms a large keyframe can add ahead of an audio packet, whic
 is what made the single-socket choice sound. A much smaller target would erode
 that margin.
 
+### Loopback capture dies on a sample-rate change — found on hardware
+
+Symptom: with BlackHole selected on both ends and everything configured
+correctly, audio would **intermittently stop for the rest of the session** while
+video kept streaming perfectly.
+
+Root cause, confirmed by a reproduction: a loopback driver's nominal sample rate
+follows whichever app is driving it, so it flips whenever playback moves between
+a 44.1 kHz source (most music) and a 48 kHz one (most video). When it changes
+under a running `AVCaptureSession`, the session **silently stops delivering
+buffers**:
+
+- delivery drops from 86 buffers/s to 0 within one second of the flip, and never returns
+- `session.isRunning` stays `true` the whole time
+- **no** `runtimeErrorNotification` and **no** `wasInterruptedNotification` is posted
+
+The captured log caught it exactly: `buffers=87 … peak=19906` at 12:57:07,
+`buffers=1` at 12:57:08, then `buffers=0` forever, with the device's rate having
+moved 44100 → 48000.
+
+Two things were ruled out by experiment, not reasoning:
+
+- **Not caused by `audioSettings`.** A native-format session with no
+  `audioSettings` at all dies identically, so demanding the wire format is not
+  the trigger and resampling ourselves would not have helped.
+- **Not a routing problem.** The instrumented `peak` was loud (19906) right up
+  to the moment of death, so signal was reaching us.
+
+Fix: a **delivery watchdog** in `AudioDeviceCapture` — since the session lies
+about being alive, arriving buffers are the only trustworthy liveness signal. It
+checks every 250 ms after a 1 s grace period and restarts the session when a
+window passes with zero buffers. Chosen over a
+`kAudioDevicePropertyNominalSampleRate` listener because the recovery action is
+identical and this also covers silent deaths we have not characterised.
+
+Cost: a measured **~600 ms gap** in the audio (≤250 ms to notice, ~350 ms for the
+new session to deliver). The restart dominates, so a tighter poll interval buys
+little — an AUHAL input unit, which handles device reconfiguration itself, is the
+upgrade path if that gap ever matters.
+
+Reproduction (needs the device, so it is not in the unit suite): run a capture
+session, then set `kAudioDevicePropertyNominalSampleRate` on the device to a
+different rate via `AudioObjectSetPropertyData` and watch buffers/sec. Before the
+fix, delivery goes to zero permanently; after it, delivery returns within a
+second.
+
 ### Accepted limitations
 
 - **No A/V PTS sync.** Audio plays as it arrives. Fine for music, calls, and
