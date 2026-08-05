@@ -623,7 +623,18 @@ class StreamClient(
         private const val TAG = "StreamClient"
         private const val MAX_FRAME_SIZE = 5 * 1024 * 1024 // 5MB
         private const val KEYFRAME_REQUEST_INTERVAL_NS = 500_000_000L
-        private const val KEYFRAME_STALE_INTERVAL_NS = 1_500_000_000L
+        /**
+         * Ask for a keyframe when none has arrived in this long — a safety net
+         * for a request that went unanswered, not the normal supply of keyframes.
+         *
+         * MUST stay above the Mac's keyframe interval (`keyframeIntervalSeconds`
+         * in VideoEncoder.swift, currently 5s). At the old 1.5s this fired
+         * constantly against a 5s GOP, so the client would have re-requested
+         * exactly the once-per-second keyframes that the longer GOP is meant to
+         * stop — the hitch would move to this side of the wire instead of going
+         * away.
+         */
+        private const val KEYFRAME_STALE_INTERVAL_NS = 6_000_000_000L
         private const val MESSAGE_VIDEO_FRAME = 0
         private const val MESSAGE_VIDEO_FRAME_WITH_METADATA = 6
         private const val MESSAGE_KEYFRAME_REQUEST = 7

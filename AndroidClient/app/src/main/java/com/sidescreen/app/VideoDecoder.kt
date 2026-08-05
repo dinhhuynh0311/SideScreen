@@ -43,6 +43,13 @@ class VideoDecoder(
     private var inputWaitSamples: Long = 0
     private var keyframeLatencySumNs: Long = 0
     private var keyframeLatencySamples: Long = 0
+
+    /**
+     * PTS of frames queued as keyframes, consumed when the matching output
+     * arrives. Bounded: entries are removed on match, and a decoder that never
+     * emits a queued frame would otherwise leak, so it is capped below.
+     */
+    private val keyframePtsUs = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
     private var latencySamples: Int = 0
     private var latencyMaxNs: Long = 0
 
@@ -431,6 +438,9 @@ class VideoDecoder(
             inputBuffer.clear()
             inputBuffer.put(frameData, 0, frameSize)
             codec.queueInputBuffer(index, 0, frameSize, frameTimestamp / 1000, 0)
+            if (isKeyframe && keyframePtsUs.size < KEYFRAME_PTS_LIMIT) {
+                keyframePtsUs.add(frameTimestamp / 1000)
+            }
             queuedInputCount++
             if (queuedInputCount == STALL_DETECT_INPUT_FRAMES && outputFrameCount == 0L && !stallReported) {
                 stallReported = true
@@ -508,8 +518,11 @@ class VideoDecoder(
                 // Keyframes are an order of magnitude larger than P-frames, so
                 // they are the obvious suspect for the max being ~1.6x the
                 // average. Tracked separately to confirm that before changing
-                // the encoder's keyframe interval on a hunch.
-                if (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME != 0) {
+                // the encoder's keyframe interval on a hunch. Matched by PTS
+                // recorded at input, because this decoder does not set
+                // BUFFER_FLAG_KEY_FRAME on output buffers — the flag is an
+                // input-side concept here and reads as zero for every frame.
+                if (keyframePtsUs.remove(info.presentationTimeUs)) {
                     keyframeLatencySumNs += latencyNs
                     keyframeLatencySamples++
                 }
@@ -634,6 +647,9 @@ class VideoDecoder(
          * video freezes for audio dropouts.
          */
         private const val INPUT_BUFFER_WAIT_MS = 20L
+        /** Dropped frames never produce output, so unmatched PTS need a ceiling. */
+        private const val KEYFRAME_PTS_LIMIT = 64
+
         private const val MAX_RENDER_LATENCY_NS = 100_000_000L
         private const val MAX_REASONABLE_LATENCY_NS = 2_000_000_000L
     }

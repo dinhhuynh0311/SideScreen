@@ -87,14 +87,37 @@ class VideoEncoder {
         // Frame rate settings
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: frameRate as CFNumber)
 
-        // Short-GOP IPP: 1 keyframe per second, P-frames in between.
-        // All-intra (every frame keyframe) was producing 3-5x more data than needed,
-        // saturating tablet decode/compose pipeline at high panel resolutions and
-        // starving Mac WindowServer with encoder load. Short-GOP IPP gives 99% of
-        // the resilience (frame loss recovery within 1 second) at a fraction of
-        // the per-frame cost. TCP over USB-C rarely drops, so 1s GOP is safe.
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: frameRate as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 1.0 as CFNumber)
+        // Long-GOP IPP. All-intra (every frame a keyframe) was producing 3-5x
+        // more data than needed, saturating the tablet's decode/compose pipeline
+        // and starving Mac WindowServer; IPP gives nearly all the resilience at a
+        // fraction of the per-frame cost.
+        //
+        // The interval was 1 second, which is measurably a once-per-second hitch:
+        // on a MatePad Pro 12.2 at 2800x1840, matching decoder output back to the
+        // frames queued as keyframes showed the keyframe IS the slowest frame in
+        // every single sampling window — ~46ms against a ~19ms average. Stretching
+        // the GOP cuts how often that lands without changing its cost.
+        //
+        // Periodic keyframes are only a safety net here: the transport is TCP, so
+        // frames cannot arrive damaged or out of order, and the client already
+        // requests a keyframe the moment its decoder reports trouble. That
+        // on-demand path, not this interval, is what recovers a broken stream.
+        //
+        // MUST stay below the client's KEYFRAME_STALE_INTERVAL_NS (StreamClient),
+        // which requests a keyframe when none has arrived recently — set this
+        // longer than that and the client simply asks for the keyframes we stopped
+        // sending, moving the hitch rather than removing it.
+        let keyframeIntervalSeconds = 5.0
+        VTSessionSetProperty(
+            session,
+            key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
+            value: (frameRate * Int(keyframeIntervalSeconds)) as CFNumber
+        )
+        VTSessionSetProperty(
+            session,
+            key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+            value: keyframeIntervalSeconds as CFNumber
+        )
 
         // Critical for low latency - NO frame reordering (no B-frames)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
