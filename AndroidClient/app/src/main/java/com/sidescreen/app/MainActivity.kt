@@ -127,8 +127,12 @@ class MainActivity : AppCompatActivity() {
     /** Consecutive bad samples before acting; pings are 1/s, so ~3s. */
     private val backlogReconnectSamples = 3
 
-    /** Never reconnect more often than this, so a sick link cannot loop. */
-    private val backlogReconnectCooldownNs = 30_000_000_000L
+    /**
+     * Never reconnect more often than this, so a sick link cannot loop. Kept
+     * short: this is a recovery path, and every second of it is a second the
+     * user spends looking at a stale picture.
+     */
+    private val backlogReconnectCooldownNs = 10_000_000_000L
 
     /** Above this the pipeline is queueing rather than keeping up. */
     private val rttHealthyMs = 250.0
@@ -390,12 +394,18 @@ class MainActivity : AppCompatActivity() {
 
         val now = System.nanoTime()
         if (now - lastBacklogReconnectNs < backlogReconnectCooldownNs) return
-        lastBacklogReconnectNs = now
         backlogRttSamples = 0
 
         mainDiag("rtt=${"%.0f".format(rttMs)}ms sustained — reconnecting to flush the backlog")
         runOnUiThread {
+            // Stamp the cooldown only once we are actually going to reconnect.
+            // Stamping before this check burned the whole cooldown on an attempt
+            // that did nothing: isConnected is briefly false right after
+            // returning from the background, which is exactly when this fires,
+            // so the real reconnect was then blocked for the full cooldown and
+            // the user sat in the lag far longer than the ~3s detection implies.
             if (!isConnected) return@runOnUiThread
+            lastBacklogReconnectNs = System.nanoTime()
             // Same path as the buttons, so wireless keeps its handshake and USB
             // keeps its loopback assumptions.
             disconnect()
