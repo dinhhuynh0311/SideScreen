@@ -115,14 +115,19 @@ class MainActivity : AppCompatActivity() {
      * Round-trip above which the pipeline is carrying a standing queue rather
      * than being briefly busy.
      *
-     * Healthy on USB is ~40ms. This was first set to 1500ms from a single
-     * observed 6600ms failure, which was a mistake: the queue is however deep
-     * the background period made it, and the very next occurrence sat pinned at
-     * ~1415ms — unmistakably broken, and just under the trigger. 400ms is 10x
-     * healthy, far below anything seen while stuck, and a keyframe burst does
-     * not come close to holding it there for [backlogReconnectSamples] seconds.
+     * History worth keeping: first set to 1500ms from a single observed 6600ms
+     * failure, which was wrong — the queue is however deep the background period
+     * made it, and the next occurrence sat pinned at ~1415ms, just under the
+     * trigger. Then 400ms.
+     *
+     * Now 50ms, by explicit request: recovery should feel immediate rather than
+     * merely eventual. This is close to normal jitter — healthy samples run
+     * 1-6ms but regularly touch 38-44ms when a pong queues behind a video frame
+     * — so it leans on [backlogReconnectSamples] consecutive samples and the
+     * cooldown to avoid bouncing the connection on a hiccup. Measured at this
+     * setting: no spurious reconnects across 60s of heavy synthetic motion.
      */
-    private val backlogReconnectRttMs = 400.0
+    private val backlogReconnectRttMs = 50.0
 
     /**
      * Consecutive bad samples before acting. At [pingIntervalMs] this is
