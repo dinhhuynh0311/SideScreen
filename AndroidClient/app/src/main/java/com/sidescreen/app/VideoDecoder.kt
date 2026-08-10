@@ -34,6 +34,10 @@ class VideoDecoder(
     private var inputFrameCount = 0L
     private var outputFrameCount = 0L
 
+    /** Queued into / emerged from the codec. A widening gap means a backlog. */
+    val inputCount: Long get() = inputFrameCount
+    val outputCount: Long get() = outputFrameCount
+
     // Decoder pipeline latency (input enqueue -> output buffer available),
     // accumulated over ~60 frames then logged. High values indicate the codec
     // is queuing frames internally (compose/present can't keep up downstream),

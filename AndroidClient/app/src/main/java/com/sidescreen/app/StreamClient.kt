@@ -52,6 +52,9 @@ class StreamClient(
     private var bytesReceived = 0L
     private var framesReceived = 0L
     private var diagFrameCount = 0L
+
+    /** Video frames read off the socket, for correlating RTT against progress. */
+    val videoFramesRead: Long get() = diagFrameCount
     private var lastStatsTime = System.currentTimeMillis()
     private val keyframeRequestLock = Any()
     private var lastKeyframeRequestNs = 0L

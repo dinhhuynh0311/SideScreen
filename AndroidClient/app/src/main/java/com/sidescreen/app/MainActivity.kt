@@ -107,6 +107,11 @@ class MainActivity : AppCompatActivity() {
      */
     private val fastRefreshThresholdHz = 100f
 
+    private var roundTripSamples = 0L
+
+    /** Above this the pipeline is queueing rather than keeping up. */
+    private val rttHealthyMs = 250.0
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -298,6 +303,35 @@ class MainActivity : AppCompatActivity() {
                     or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                     or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
                     or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+            )
+        }
+    }
+
+    /**
+     * Records the ping round-trip to the persistent diag log.
+     *
+     * The number was only ever drawn into a TextView, so after the fact there
+     * was no trace of it — and it is the single most diagnostic value we have.
+     * A 30-second RTT cannot be network latency over a USB loopback; it means
+     * the pong sat behind a queue that took 30s to work through, which is a
+     * backlog somewhere between the Mac's socket and this decoder. Logging it
+     * alongside the frame counters shows which side the queue is on and whether
+     * it drains or grows.
+     *
+     * Logged only when it matters: every sample while unhealthy, otherwise one
+     * in ten, so an overnight session does not bury the interesting part.
+     */
+    private fun noteRoundTrip(rttMs: Double) {
+        roundTripSamples++
+        val unhealthy = rttMs > rttHealthyMs
+        if (unhealthy || roundTripSamples % 10L == 0L) {
+            val decoder = videoDecoder
+            mainDiag(
+                "rtt=${"%.0f".format(rttMs)}ms" +
+                    (if (unhealthy) " UNHEALTHY" else "") +
+                    ", framesReceived=${streamClient?.videoFramesRead ?: -1}" +
+                    ", decoderIn=${decoder?.inputCount ?: -1}" +
+                    ", decoderOut=${decoder?.outputCount ?: -1}",
             )
         }
     }
@@ -1132,6 +1166,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         streamClient?.onLatencyMeasured = { rttMs ->
+            noteRoundTrip(rttMs)
             runOnUiThread {
                 binding.latencyText.text = String.format("%.1f ms", rttMs)
             }
@@ -1293,6 +1328,7 @@ class MainActivity : AppCompatActivity() {
 
                 // Latency measurement via ping/pong
                 streamClient?.onLatencyMeasured = { rttMs ->
+                    noteRoundTrip(rttMs)
                     runOnUiThread {
                         binding.latencyText.text = String.format("%.1f ms", rttMs)
                     }
