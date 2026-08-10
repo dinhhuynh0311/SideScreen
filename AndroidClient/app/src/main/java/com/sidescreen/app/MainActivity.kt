@@ -79,6 +79,28 @@ class MainActivity : AppCompatActivity() {
     private var checklistRunnable: Runnable? = null
     private var isConnected = false // Track connection state to prevent checklist conflicts
 
+    /**
+     * True from the moment a connection is *attempted* until it is torn down.
+     *
+     * [isConnected] cannot guard the checklist's socket probe on its own: it only
+     * becomes true once the handshake completes, leaving the whole connect window
+     * unguarded, and it goes false the instant a session drops. The probe in
+     * [checkServerRunning] is a real client as far as the Mac is concerned — it
+     * connects and reads the display config — and the Mac serves one client at a
+     * time, cancelling the existing connection whenever a new one arrives.
+     *
+     * Measured: a single bare TCP connection, open 300ms and sending nothing,
+     * makes the host log "Connection cancelled" and the live client die with
+     * EOFException. With only the [isConnected] guard, a dropped session left the
+     * probe firing every 2s, and each probe killed the reconnect that was trying
+     * to replace it — an unrecoverable loop that looked like a frozen app while
+     * the Mac still showed a client connected.
+     *
+     * Volatile: set on the main thread, read from the probe's IO coroutine.
+     */
+    @Volatile
+    private var sessionActive = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -1126,6 +1148,9 @@ class MainActivity : AppCompatActivity() {
         deviceName: String,
         macName: String,
     ) {
+        // Same reasoning as connect(): claim the session before any socket work.
+        sessionActive = true
+        stopChecklistUpdates()
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting wirelessly to $host:$port...")
@@ -1153,6 +1178,11 @@ class MainActivity : AppCompatActivity() {
         host: String,
         port: Int,
     ) {
+        // Before the coroutine, not inside it: the checklist probe fires on a
+        // 2s timer and would otherwise slip into the gap and cancel this
+        // connection on the Mac before it finishes handshaking.
+        sessionActive = true
+        stopChecklistUpdates()
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting to $host:$port...")
@@ -1314,6 +1344,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun disconnect() {
+        sessionActive = false
         stopPingTimer()
         streamClient?.disconnect()
         // Release the AudioTrack here rather than in cleanup(): cleanup() calls
@@ -1516,8 +1547,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateChecklist() {
-        // Skip if connected (to prevent socket conflicts)
-        if (isConnected) return
+        // Skip while a session exists or is being established — the probe below
+        // would cancel it. See sessionActive.
+        if (isConnected || sessionActive) return
 
         // Check Developer Mode (if we can run this app with USB debugging, dev mode is enabled)
         val isDeveloperModeEnabled =
@@ -1544,8 +1576,9 @@ class MainActivity : AppCompatActivity() {
 
         // Check Mac Server (try to connect to port)
         lifecycleScope.launch(Dispatchers.IO) {
-            // Double-check connection state before socket test
-            if (isConnected) return@launch
+            // Re-check on this thread: a connect can start between the post above
+            // and this coroutine running, and probing then kills it.
+            if (isConnected || sessionActive) return@launch
 
             val port =
                 binding.portInput.text
