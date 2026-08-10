@@ -124,15 +124,34 @@ class MainActivity : AppCompatActivity() {
      */
     private val backlogReconnectRttMs = 400.0
 
-    /** Consecutive bad samples before acting; pings are 1/s, so ~3s. */
+    /**
+     * Consecutive bad samples before acting. At [pingIntervalMs] this is
+     * ~600ms of detection — fast enough to feel immediate, still three
+     * independent measurements so one scheduling hiccup cannot bounce the
+     * connection.
+     */
     private val backlogReconnectSamples = 3
+
+    /** When the last pong arrived; 0 until the first one. */
+    @Volatile
+    private var lastPongNs = 0L
+
+    /**
+     * No pong for this long means the stream has stalled outright rather than
+     * merely fallen behind. Well clear of [pingIntervalMs] plus the worst
+     * healthy round-trip, so normal jitter cannot reach it.
+     */
+    private val stallTimeoutNs = 1_500_000_000L
+
+    /** Ping cadence; also the resolution of backlog detection. */
+    private val pingIntervalMs = 200L
 
     /**
      * Never reconnect more often than this, so a sick link cannot loop. Kept
      * short: this is a recovery path, and every second of it is a second the
      * user spends looking at a stale picture.
      */
-    private val backlogReconnectCooldownNs = 10_000_000_000L
+    private val backlogReconnectCooldownNs = 5_000_000_000L
 
     /** Above this the pipeline is queueing rather than keeping up. */
     private val rttHealthyMs = 250.0
@@ -385,18 +404,38 @@ class MainActivity : AppCompatActivity() {
      * than in a loop.
      */
     private fun maybeReconnectForBacklog(rttMs: Double) {
+        lastPongNs = System.nanoTime()
         if (rttMs <= backlogReconnectRttMs) {
             backlogRttSamples = 0
             return
         }
         backlogRttSamples++
         if (backlogRttSamples < backlogReconnectSamples) return
+        backlogRttSamples = 0
+        reconnectToFlush("rtt=${"%.0f".format(rttMs)}ms sustained")
+    }
 
+    /**
+     * Reconnects when pongs stop arriving entirely.
+     *
+     * [maybeReconnectForBacklog] only runs when a pong comes back, so a stream
+     * that stalls outright produces no samples and it never fires — the blind
+     * spot behind a frozen picture that never recovered. Driven from the ping
+     * loop instead, so it needs nothing from the receive path.
+     */
+    private fun checkForStalledStream() {
+        val last = lastPongNs
+        if (last == 0L) return
+        if (System.nanoTime() - last < stallTimeoutNs) return
+        lastPongNs = System.nanoTime() // don't re-fire before the reconnect lands
+        reconnectToFlush("no pong for ${stallTimeoutNs / 1_000_000}ms")
+    }
+
+    private fun reconnectToFlush(reason: String) {
         val now = System.nanoTime()
         if (now - lastBacklogReconnectNs < backlogReconnectCooldownNs) return
-        backlogRttSamples = 0
 
-        mainDiag("rtt=${"%.0f".format(rttMs)}ms sustained — reconnecting to flush the backlog")
+        mainDiag("$reason — reconnecting to flush the backlog")
         runOnUiThread {
             // Stamp the cooldown only once we are actually going to reconnect.
             // Stamping before this check burned the whole cooldown on an attempt
@@ -1580,11 +1619,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun startPingTimer() {
         stopPingTimer()
+        lastPongNs = 0L
         pingJob =
             lifecycleScope.launch(Dispatchers.IO) {
                 while (true) {
-                    kotlinx.coroutines.delay(1000) // Ping every 1 second
+                    // 200ms rather than 1s: the round-trip is how we detect a
+                    // standing queue, and at one sample a second the detection
+                    // alone cost three seconds of staring at a stale picture.
+                    // A ping is a handful of bytes, so the cost is nil.
+                    kotlinx.coroutines.delay(pingIntervalMs)
                     streamClient?.sendPing()
+                    checkForStalledStream()
                 }
             }
     }
