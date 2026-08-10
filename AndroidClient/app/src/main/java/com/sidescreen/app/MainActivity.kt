@@ -108,6 +108,21 @@ class MainActivity : AppCompatActivity() {
     private val fastRefreshThresholdHz = 100f
 
     private var roundTripSamples = 0L
+    private var backlogRttSamples = 0
+    private var lastBacklogReconnectNs = 0L
+
+    /**
+     * Round-trip above which the pipeline is carrying a standing queue rather
+     * than being briefly busy. Healthy is ~40ms and the observed failure sat at
+     * 6600ms, so 1500ms is clear of both.
+     */
+    private val backlogReconnectRttMs = 1500.0
+
+    /** Consecutive bad samples before acting; pings are 1/s, so ~3s. */
+    private val backlogReconnectSamples = 3
+
+    /** Never reconnect more often than this, so a sick link cannot loop. */
+    private val backlogReconnectCooldownNs = 30_000_000_000L
 
     /** Above this the pipeline is queueing rather than keeping up. */
     private val rttHealthyMs = 250.0
@@ -324,6 +339,7 @@ class MainActivity : AppCompatActivity() {
     private fun noteRoundTrip(rttMs: Double) {
         roundTripSamples++
         val unhealthy = rttMs > rttHealthyMs
+        maybeReconnectForBacklog(rttMs)
         if (unhealthy || roundTripSamples % 10L == 0L) {
             val decoder = videoDecoder
             mainDiag(
@@ -333,6 +349,66 @@ class MainActivity : AppCompatActivity() {
                     ", decoderIn=${decoder?.inputCount ?: -1}" +
                     ", decoderOut=${decoder?.outputCount ?: -1}",
             )
+        }
+    }
+
+    /**
+     * Reconnects when the round-trip shows a standing queue, which is the only
+     * thing that actually clears one.
+     *
+     * After the app spends time in the background the socket holds seconds of
+     * frames, and on return the client reads, decodes and renders at exactly the
+     * rate the Mac produces — so the queue never shrinks. A captured trace sat at
+     * a 6.6 SECOND round-trip, falling 2-4ms per second, with every per-frame
+     * metric healthy: the picture was simply six seconds old, permanently.
+     * Reconnecting drops both endpoints' buffers, which is why doing it by hand
+     * has been the only cure.
+     *
+     * Deliberately NOT frame-dropping. Dropping to catch up means dropping
+     * P-frames, which breaks the reference chain and demands a keyframe per
+     * drop; measured, that drove the encoder to ~123Mbps of near-all-intra and
+     * froze the picture outright — far worse than the lag.
+     *
+     * Requires [backlogReconnectSamples] consecutive bad samples (~3s, since
+     * pings are 1/s) so a single scheduling hiccup cannot bounce the connection,
+     * and a cooldown so a genuinely sick link reconnects occasionally rather
+     * than in a loop.
+     */
+    private fun maybeReconnectForBacklog(rttMs: Double) {
+        if (rttMs <= backlogReconnectRttMs) {
+            backlogRttSamples = 0
+            return
+        }
+        backlogRttSamples++
+        if (backlogRttSamples < backlogReconnectSamples) return
+
+        val now = System.nanoTime()
+        if (now - lastBacklogReconnectNs < backlogReconnectCooldownNs) return
+        lastBacklogReconnectNs = now
+        backlogRttSamples = 0
+
+        mainDiag("rtt=${"%.0f".format(rttMs)}ms sustained — reconnecting to flush the backlog")
+        runOnUiThread {
+            if (!isConnected) return@runOnUiThread
+            // Same path as the buttons, so wireless keeps its handshake and USB
+            // keeps its loopback assumptions.
+            disconnect()
+            if (prefs.connectionMode == ConnectionMode.WIRELESS) {
+                // The controller owns the paired host and token, so go through
+                // its own reconnect button rather than duplicating that state.
+                binding.wirelessReconnectButton.performClick()
+            } else {
+                val host =
+                    binding.hostInput.text
+                        .toString()
+                        .ifEmpty { "127.0.0.1" }
+                        .let { if (it.equals("localhost", ignoreCase = true)) "127.0.0.1" else it }
+                val port =
+                    binding.portInput.text
+                        .toString()
+                        .toIntOrNull() ?: 54321
+                connect(host, port)
+            }
         }
     }
 
