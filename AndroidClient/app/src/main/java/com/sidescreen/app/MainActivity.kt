@@ -503,7 +503,75 @@ class MainActivity : AppCompatActivity() {
         val params = window.attributes
         params.preferredDisplayModeId = modeId
         window.attributes = params
+        declareSurfaceFrameRate(pin)
         mainDiag("preferredDisplayModeId=$modeId (pin=$pin)")
+    }
+
+    /**
+     * Tells SurfaceFlinger what cadence the video surface produces, which is the
+     * signal it actually uses when choosing a display refresh rate.
+     *
+     * Measured on a MatePad Pro 12.2: the panel holds 120Hz for a second or two
+     * after any interaction and then falls back to 60Hz while an ~85fps stream
+     * keeps arriving —
+     *
+     *   before background   60Hz
+     *   after return        120Hz
+     *   4s later, no touch  60Hz
+     *   after one tap       120Hz
+     *   3s after the tap    60Hz
+     *
+     * — which is why poking the UI visibly improves things and why it decays
+     * again on its own. `preferredDisplayModeId` did not move it: that is a
+     * window-level hint this OEM ignores. Surface.setFrameRate is per-surface
+     * and is the input to the refresh-rate policy, so it is the request that has
+     * a chance of sticking without a finger on the screen.
+     *
+     * Declares a mode rate rather than a measured stream rate: this is a mirror,
+     * the goal is simply "keep the panel fast", and DEFAULT compatibility says we
+     * can adapt rather than claiming an exact cadence we do not hold.
+     */
+    private fun declareSurfaceFrameRate(pin: Boolean) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        val surface = activeVideoSurface()?.first ?: return
+        if (!surface.isValid) return
+
+        val rate = if (pin) preferredRefreshRateAtCurrentSize() ?: return else 0f
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                surface.setFrameRate(
+                    rate,
+                    Surface.FRAME_RATE_COMPATIBILITY_DEFAULT,
+                    Surface.CHANGE_FRAME_RATE_ALWAYS,
+                )
+            } else {
+                surface.setFrameRate(rate, Surface.FRAME_RATE_COMPATIBILITY_DEFAULT)
+            }
+            mainDiag("surface.setFrameRate($rate)")
+        } catch (e: IllegalStateException) {
+            // Surface can be abandoned between the validity check and here.
+            mainDiag("setFrameRate failed: ${e.message}")
+        }
+    }
+
+    private fun preferredRefreshRateAtCurrentSize(): Float? {
+        val display =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                display
+            } else {
+                @Suppress("DEPRECATION")
+                windowManager.defaultDisplay
+            } ?: return null
+        val current = display.mode ?: return null
+        val sameSize =
+            display.supportedModes
+                .filter { it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight }
+        // Same rule as the mode pin: the lowest rate that clears the threshold,
+        // not the headline one. Declaring 144 got us nowhere — the device
+        // appears to reserve it, and an unsatisfiable request is simply ignored,
+        // leaving the panel to idle back down to 60.
+        return sameSize.filter { it.refreshRate >= fastRefreshThresholdHz }.minOfOrNull { it.refreshRate }
+            ?: sameSize.maxOfOrNull { it.refreshRate }
     }
 
     /**
