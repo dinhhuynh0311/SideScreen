@@ -101,6 +101,12 @@ class MainActivity : AppCompatActivity() {
     @Volatile
     private var sessionActive = false
 
+    /**
+     * Anything at or above this counts as fast enough for the stream, so we ask
+     * for the cheapest mode that clears it rather than the panel's headline rate.
+     */
+    private val fastRefreshThresholdHz = 100f
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -297,6 +303,80 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
+     * Pins the panel to its fastest refresh rate while streaming, or releases it
+     * back to the system's choice.
+     *
+     * The panel is variable-rate (60/120/144 on a MatePad Pro 12.2) and the
+     * system drops it to 60Hz for whatever it thinks the foreground app needs.
+     * Watching a video in another app leaves it there, and returning to
+     * SideScreen does NOT bring it back: the app's own log shows five decoder
+     * starts at 120Hz and then one at 60Hz immediately after a YouTube
+     * round-trip, with `dumpsys display` confirming mActiveModeId had moved to
+     * the 60Hz mode. An ~80fps stream landing on a 60Hz panel is judder, which
+     * is what "laggy after coming back" was.
+     *
+     * We only ever read `displayRefreshRate` before; nothing ever asked for a
+     * rate. preferredDisplayModeId is the request, and it has to be re-applied
+     * on every return because the surface is recreated and the system may have
+     * moved the panel while we were away.
+     *
+     * Only while streaming: pinning 120Hz+ on the connect screen would burn
+     * battery for a static form.
+     */
+    private fun applyPreferredRefreshRate(pin: Boolean) {
+        val modeId =
+            if (pin) {
+                fastestModeIdAtCurrentSize() ?: return
+            } else {
+                0 // 0 = no preference, back to the system's dynamic choice
+            }
+        // Re-assign unconditionally, even when the field already holds modeId.
+        // The attribute survives a trip to another app but the panel does not:
+        // measured a decoder restart at 60Hz while window.attributes still said
+        // the 144Hz mode, so an "already set, nothing to do" early-out silently
+        // skipped the one moment the request needed re-making.
+        val params = window.attributes
+        params.preferredDisplayModeId = modeId
+        window.attributes = params
+        mainDiag("preferredDisplayModeId=$modeId (pin=$pin)")
+    }
+
+    /**
+     * Fastest supported mode at the resolution currently in use. Restricted to
+     * the current size so we never change resolution as a side effect of asking
+     * for a refresh rate.
+     *
+     * Returned even when the panel is already running it — pinning is the point.
+     * Being at 120Hz right now is exactly the state the system takes away the
+     * moment it decides the foreground app does not need it.
+     */
+    private fun fastestModeIdAtCurrentSize(): Int? {
+        val display =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                display
+            } else {
+                @Suppress("DEPRECATION")
+                windowManager.defaultDisplay
+            } ?: return null
+        val current = display.mode ?: return null
+        val sameSize =
+            display.supportedModes
+                .filter { it.physicalWidth == current.physicalWidth && it.physicalHeight == current.physicalHeight }
+        if (sameSize.isEmpty()) return null
+
+        // The LOWEST mode at or above the fast threshold, not the outright
+        // fastest. This panel's fastest is 144Hz, which HarmonyOS appears to
+        // reserve: requesting it left SurfaceFlinger parked at 60 instead of
+        // granting the 120Hz it happily runs by default. 120 is plenty for a
+        // 90Hz stream, and asking for the modest option is likelier to be
+        // honoured than asking for the headline one.
+        return (
+            sameSize.filter { it.refreshRate >= fastRefreshThresholdHz }.minByOrNull { it.refreshRate }
+                ?: sameSize.maxByOrNull { it.refreshRate }
+        )?.modeId
+    }
+
+    /**
      * Disable fullscreen mode (when disconnected)
      */
     private fun disableFullscreenMode() {
@@ -326,6 +406,9 @@ class MainActivity : AppCompatActivity() {
                     mainDiag("surfaceChanged: ${width}x$height")
                     log("Surface changed: ${width}x$height")
                     currentSurfaceHolder = holder
+                    // Coming back from another app lands here, and the system may
+                    // have parked the panel at 60Hz meanwhile — re-assert.
+                    if (isConnected) applyPreferredRefreshRate(pin = true)
                     initializeDecoderForCurrentSurface()
                 }
 
@@ -1075,6 +1158,7 @@ class MainActivity : AppCompatActivity() {
                     startPingTimer()
                     stopChecklistUpdates()
                     enableFullscreenMode()
+                    applyPreferredRefreshRate(pin = true)
                     binding.settingsPanel.visibility = View.GONE
                     applySettingsButtonVisibility()
                     restoreSettingsButtonPosition()
@@ -1093,6 +1177,7 @@ class MainActivity : AppCompatActivity() {
                 } else {
                     stopPingTimer()
                     disableFullscreenMode()
+                    applyPreferredRefreshRate(pin = false)
                     resetOrientationToSensor()
                     binding.settingsPanel.visibility = View.VISIBLE
                     binding.settingsButton.visibility = View.GONE
@@ -1249,6 +1334,7 @@ class MainActivity : AppCompatActivity() {
 
                             // Enter fullscreen mode when connected
                             enableFullscreenMode()
+                            applyPreferredRefreshRate(pin = true)
 
                             binding.settingsPanel.visibility = View.GONE
                             applySettingsButtonVisibility()
@@ -1260,6 +1346,7 @@ class MainActivity : AppCompatActivity() {
 
                             // Exit fullscreen mode when disconnected
                             disableFullscreenMode()
+                            applyPreferredRefreshRate(pin = false)
 
                             // Reset to follow device sensor when disconnected
                             resetOrientationToSensor()
