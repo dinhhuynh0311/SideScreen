@@ -89,6 +89,23 @@ class StreamingServer {
     private var isStopped = false
     private var connectionReady = false
     private var waitingForSyncFrame = false
+
+    /// Frames handed to `connection.send` that have not reported completion.
+    /// Touched only on `frameQueue`.
+    private var pendingSends = 0
+
+    /// Set when a P-frame was dropped for backpressure, cleared when the
+    /// resulting keyframe goes out — so a stalled client triggers one resync
+    /// request, not one per dropped frame.
+    private var requestedResyncKeyframe = false
+
+    /// How many frames may be in flight to the client before we start dropping.
+    ///
+    /// Small on purpose: this is a mirror, not a download. At ~90fps four frames
+    /// is ~45ms of slack — enough to ride out normal scheduling jitter, far too
+    /// little to accumulate the seconds of lag that made returning from another
+    /// app feel frozen.
+    private static let maxPendingSends = 4
     private var clientSupportsFrameMetadata = false
     private var clientIsAvcOnly = false
     /// The connection that sent clientSupportsAudio (type 12), or nil. Held as
@@ -158,6 +175,14 @@ class StreamingServer {
         inputBuffer.removeAll(keepingCapacity: true)
         connection = newConnection
         droppedFrames = 0
+        // Must be reset per connection: a connection that dies with sends
+        // outstanding never runs their completion handlers, so a stale count
+        // would sit at the cap forever and the next client would be starved of
+        // every P-frame it should have received.
+        frameQueue.async { [weak self] in
+            self?.pendingSends = 0
+            self?.requestedResyncKeyframe = false
+        }
 
         connection?.stateUpdateHandler = { [weak self] state in
             debugLog("Connection state: \(state)")
@@ -513,14 +538,43 @@ class StreamingServer {
             debugLog("First keyframe sent to new client")
         }
 
-        // No frame-age dropping or backpressure — send everything immediately.
-        // The encode queue depth limit (2 pending) in ScreenCapture handles flow control.
         frameQueue.async { [weak self] in
             guard let self = self else { return }
 
+            // Backpressure. NWConnection.send queues without limit, so a client
+            // that stops draining — an Android app frozen in the background is
+            // the case that bit us — builds a backlog bounded only by memory.
+            // The tablet then has to chew through every queued frame on return,
+            // decoding each one at ~11ms, which is why a trip to another app came
+            // back with a 30-SECOND ping RTT and a picture half a minute stale.
+            //
+            // A live mirror has no use for old frames: drop instead of buffering,
+            // so the worst case is a brief gap rather than a growing lag that
+            // only a reconnect clears. Keyframes are never dropped here — they
+            // are the resync point, and losing one would leave the client with
+            // nothing decodable.
+            if !isKeyframe && self.pendingSends >= Self.maxPendingSends {
+                self.droppedFrames += 1
+                // P-frames are a reference chain, so a gap corrupts everything
+                // after it until the next IDR. Ask for one now rather than
+                // showing smeared frames until the (5s) periodic keyframe.
+                if !self.requestedResyncKeyframe {
+                    self.requestedResyncKeyframe = true
+                    self.onKeyframeRequested?(true)
+                }
+                return
+            }
+            if isKeyframe {
+                self.requestedResyncKeyframe = false
+            }
+
             let packet = self.makeFramePacket(data, timestamp: timestamp, isKeyframe: isKeyframe)
 
+            self.pendingSends += 1
             connection.send(content: packet, completion: .contentProcessed { error in
+                self.frameQueue.async {
+                    self.pendingSends -= 1
+                }
                 if error != nil {
                     self.droppedFrames += 1
                 }
