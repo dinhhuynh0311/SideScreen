@@ -67,6 +67,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let audioMuteQueue = DispatchQueue(label: "com.sidescreen.audioMute", qos: .utility)
     /// Non-nil only while capturing from a loopback device instead of the SCK tap.
     private var audioDeviceCapture: AudioDeviceCapture?
+
+    /// Effective refresh rate the running pipeline was built with, so the
+    /// refresh-rate observer can skip restarts that would change nothing.
+    private var lastAppliedRefreshRate: Int?
     /// Mute state before we changed it. nil means we could not read it — see
     /// `didMuteMac`, which is what actually decides whether we restore.
     private var previousMacMuteState: Bool?
@@ -281,12 +285,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .dropFirst()
             .removeDuplicates()
             .sink { [weak self] resolution in
+                self?.restartRunningServer(reason: "Resolution changed to \(resolution)")
+            }
+            .store(in: &cancellables)
+
+        // Refresh rate shapes the virtual display mode AND the capture interval,
+        // so it needs the same rebuild as a resolution change. Debounced because
+        // the custom-FPS slider emits continuously while dragging; the
+        // effective-rate guard then skips restarts that would change nothing (a
+        // drag ending back on the applied value, or Gaming Boost pinning 120).
+        settings.$refreshRate
+            .dropFirst()
+            .removeDuplicates()
+            .debounce(for: .seconds(1.2), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
                 guard let self = self else { return }
                 Task { @MainActor in
-                    guard self.settings.isRunning else { return }
-                    debugLog("Resolution changed to \(resolution) — restarting server to rebuild virtual display")
-                    self.stopServer()
-                    await self.startServer()
+                    let effective = self.settings.effectiveRefreshRate
+                    guard effective != self.lastAppliedRefreshRate else { return }
+                    self.restartRunningServer(reason: "Refresh rate changed to \(effective) Hz")
                 }
             }
             .store(in: &cancellables)
@@ -297,13 +314,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .dropFirst()
             .removeDuplicates()
             .sink { [weak self] enabled in
-                guard let self = self else { return }
-                Task { @MainActor in
-                    guard self.settings.isRunning else { return }
-                    debugLog("Audio \(enabled ? "enabled" : "disabled") — restarting server")
-                    self.stopServer()
-                    await self.startServer()
-                }
+                self?.restartRunningServer(reason: "Audio \(enabled ? "enabled" : "disabled")")
             }
             .store(in: &cancellables)
 
@@ -313,14 +324,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .dropFirst()
             .removeDuplicates()
             .sink { [weak self] device in
-                guard let self = self else { return }
-                Task { @MainActor in
-                    guard self.settings.isRunning else { return }
-                    let label = device.isEmpty ? "system tap" : device
-                    debugLog("Audio source changed to \(label) — restarting server")
-                    self.stopServer()
-                    await self.startServer()
-                }
+                let label = device.isEmpty ? "system tap" : device
+                self?.restartRunningServer(reason: "Audio source changed to \(label)")
             }
             .store(in: &cancellables)
 
@@ -663,6 +668,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // silent no-op until the next restart. The SCK tap stays off when a
             // loopback device is the source, so the two never both feed the wire.
             screenCapture?.captureAudio = settings.audioEnabled && !settings.usesAudioDeviceSource
+            lastAppliedRefreshRate = settings.effectiveRefreshRate
             try await screenCapture?.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
             startAudioDeviceCaptureIfSelected()
 
@@ -805,6 +811,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // speakers, so muting on top of it would only silence the tablet too.
         guard !settings.usesAudioDeviceSource else { return }
         requestMuteMac()
+    }
+
+    /// Stop-and-restart the server to rebuild the virtual display and capture
+    /// pipeline. No-op while stopped. Three settings observers needed the exact
+    /// same stop/start dance, and a fourth (refresh rate) was missing entirely.
+    private func restartRunningServer(reason: String) {
+        Task { @MainActor in
+            guard settings.isRunning else { return }
+            debugLog("\(reason) — restarting server to rebuild virtual display")
+            stopServer()
+            await startServer()
+        }
     }
 
     /// Starts loopback-device capture when the settings select one, falling back

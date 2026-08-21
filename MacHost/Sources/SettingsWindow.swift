@@ -442,6 +442,37 @@ struct SettingsView: View {
                                     }
                                 }
 
+                                // Any rate, not just the presets: a tablet can be
+                                // artifact-free below a preset but not at it, and
+                                // matching the panel's own rate exactly matters
+                                // more than picking a round number — a 90fps
+                                // stream on a panel sitting at 60Hz lands unevenly
+                                // no matter how low the latency is.
+                                // Upper bound follows the presets, so 144 stays
+                                // reachable here.
+                                HStack(spacing: 8) {
+                                    Text("Custom")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary)
+                                    Slider(
+                                        value: Binding(
+                                            get: { Double(settings.refreshRate) },
+                                            set: {
+                                                let rate = Int($0.rounded())
+                                                // Same-value stores still fire didSet
+                                                // and a UserDefaults write — a drag
+                                                // would otherwise write once per pixel.
+                                                if rate != settings.refreshRate {
+                                                    settings.refreshRate = rate
+                                                }
+                                            }
+                                        ),
+                                        in: 15...144,
+                                        step: 1
+                                    )
+                                    .disabled(settings.gamingBoost)
+                                }
+
                                 if settings.gamingBoost {
                                     HStack(spacing: 4) {
                                         Image(systemName: "bolt.fill")
