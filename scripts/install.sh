@@ -79,6 +79,16 @@ cat > "$APP_DIR/Info.plist" << 'PLIST'
     <true/>
     <key>LSUIElement</key>
     <false/>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Side Screen needs screen recording access to capture your virtual display and stream it to your Android device.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Side Screen needs microphone access to capture from a loopback audio device (macOS treats loopback drivers as microphones) so your Mac's audio can play on the tablet.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>Side Screen needs Local Network access so your Android tablet can connect to the Mac over WiFi for wireless mode. Without this, only USB-tethered connections work.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_sidescreen._tcp</string>
+    </array>
 </dict>
 </plist>
 PLIST
