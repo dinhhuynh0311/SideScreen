@@ -32,12 +32,12 @@ final class AudioPCMTests: XCTestCase {
     }
 
     func testAudioPacketPrefixesTypeAndBigEndianLength() {
-        let p = AudioPCM.audioPacket(messageType: 13, pcm: Data([0xAA, 0xBB]))
-        XCTAssertEqual(Array(p), [13, 0x00, 0x00, 0x00, 0x02, 0xAA, 0xBB])
+        let p = AudioPCM.audioPacket(messageType: 16, pcm: Data([0xAA, 0xBB]))
+        XCTAssertEqual(Array(p), [16, 0x00, 0x00, 0x00, 0x02, 0xAA, 0xBB])
     }
 
     func testEmptyPcmStillProducesWellFormedHeader() {
-        let p = AudioPCM.audioPacket(messageType: 13, pcm: Data())
-        XCTAssertEqual(Array(p), [13, 0x00, 0x00, 0x00, 0x00])
+        let p = AudioPCM.audioPacket(messageType: 16, pcm: Data())
+        XCTAssertEqual(Array(p), [16, 0x00, 0x00, 0x00, 0x00])
     }
 }

@@ -53,10 +53,13 @@ baked into the existing types:
   bit set (type 11, 7-bits-per-byte encoding) — otherwise old hosts desync the stream.
 - Server→client messages that old clients don't know cause a **disconnect**. Type 10
   (`codecSelected`) is therefore sent only to clients that first opted in with type 9.
-- Capability messages (9 `clientAvcOnly`, 11 `clientDecoderLimits`, 12 `clientSupportsAudio`) must
-  arrive **before** type 8 (`clientSupportsFrameMetadata`), which is what triggers
-  `finishProtocolStartup` on the host. Type 13 (`audioFrame`) follows the type-10 rule: sent only
-  to clients that opted in with type 12.
+- Capability messages (9 `clientAvcOnly`, 11 `clientDecoderLimits`, 12
+  `clientSupportsDesktopGeometry`, 14 `clientDecoderLimitTable`, 15 `clientSupportsAudio`, 18
+  `clientIdentity`) must arrive **before** type 8 (`clientSupportsFrameMetadata`), which is what
+  triggers `finishProtocolStartup` on the host. Server→client 13 (`desktopGeometry`) and 16
+  (`audioFrame`) follow the type-10 rule: sent only to clients that opted in with 12 / 15.
+- Type numbers 12–14 and 18 are upstream's; this fork's audio is 15/16 (moved from 12/13 when
+  upstream 1.1.1 was merged). 17 is still free. Check upstream before taking a new number.
 - `finishProtocolStartup` ordering is load-bearing: codec is announced, then `onCodecNegotiated`
   runs synchronously (it swaps the encoder and clamps `displayWidth/Height`), then the display
   config is sent with already-clamped dimensions.

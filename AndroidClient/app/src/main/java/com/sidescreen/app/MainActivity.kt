@@ -38,14 +38,21 @@ import com.google.android.material.slider.Slider
 import com.google.android.material.switchmaterial.SwitchMaterial
 import com.sidescreen.app.databinding.ActivityMainBinding
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import java.net.InetSocketAddress
 import java.net.Socket
 
 private fun mainDiag(msg: String) = DiagLog.log("MA", msg)
 
+private const val MAC_APP_URL = "https://sidescreen.dev"
+private const val REPORT_PROBLEM_URL = "https://github.com/tranvuongquocdat/SideScreen/issues/new/choose"
+
 class MainActivity : AppCompatActivity() {
     private lateinit var wirelessController: WirelessTabController
+    private lateinit var appUpdater: AppUpdater
+    private lateinit var reviewPrompter: ReviewPrompter
     private val pairedHostStorage by lazy { PairedHostStorage(this) }
     private val cameraPerm by lazy { CameraPermissionManager(this) }
     private lateinit var binding: ActivityMainBinding
@@ -55,9 +62,18 @@ class MainActivity : AppCompatActivity() {
     // `by lazy` because the AudioManager query needs an attached Context, which a
     // field initializer does not have. First use is the first audio frame.
     private val audioPlayer by lazy { AudioPlayer(nativeOutputBurstFrames()) }
+
+    /** In-flight code-pairing attempt (issue #35); cancelled when its dialog closes. */
+    private var pairingJob: Job? = null
     private var currentSurfaceHolder: SurfaceHolder? = null
     private var currentTextureSurface: Surface? = null
     private var decoderUsingTextureView = false
+
+    // Logical desktop behind the stream, 0 when the Mac predates desktopGeometry.
+    // Shown next to the stream size; never used to size the decoder.
+    private var desktopWidth = 0
+    private var desktopHeight = 0
+
     private var displayWidth = 0 // 0 = no config received yet
     private var displayHeight = 0 // 0 = no config received yet
     private var displayRotation = 0 // 0, 90, 180, 270 degrees
@@ -160,6 +176,13 @@ class MainActivity : AppCompatActivity() {
 
     /** Above this the pipeline is queueing rather than keeping up. */
     private val rttHealthyMs = 250.0
+    // Demo mode: plays a bundled clip so the app can be tried without a Mac
+    private var demoPlayer: DemoPlayer? = null
+    private var demoActive = false
+    private var demoTouchHintShown = false
+
+    /** True while video is on screen — a real session or the demo. Drives the streaming chrome. */
+    private val isStreamingUi get() = isConnected || demoActive
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -181,6 +204,8 @@ class MainActivity : AppCompatActivity() {
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        appUpdater = AppUpdater(this)
+        reviewPrompter = ReviewPrompter(this) { !isStreamingUi }
 
         // Apply fullscreen mode immediately
         enableFullscreenMode()
@@ -245,6 +270,9 @@ class MainActivity : AppCompatActivity() {
                         permDenied = binding.wirelessPermDenied,
                         scanButton = binding.wirelessScanButton,
                         rescanButton = binding.wirelessRescanButton,
+                        enterCodeButton = binding.wirelessEnterCodeButton,
+                        repairEnterCodeButton = binding.wirelessRepairEnterCodeButton,
+                        permDeniedEnterCodeButton = binding.wirelessPermDeniedEnterCodeButton,
                         disconnectButton = binding.wirelessDisconnectButton,
                         forgetButton = binding.wirelessForgetButton,
                         reconnectButton = binding.wirelessReconnectButton,
@@ -264,6 +292,7 @@ class MainActivity : AppCompatActivity() {
                 onConnectRequested = { host, port, token, deviceName, macName ->
                     connectWireless(host, port, token, deviceName, macName)
                 },
+                onCodePairRequested = { showCodePairingDialog() },
             )
         wirelessController.bind()
         binding.wirelessDisconnectButton.setOnClickListener { disconnect() }
@@ -702,11 +731,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.surfaceView.setOnTouchListener { view, event ->
-            handleTouch(view, event)
+            if (demoActive) showDemoTouchHint(event) else handleTouch(view, event)
             true
         }
         binding.textureView.setOnTouchListener { view, event ->
-            handleTouch(view, event)
+            if (demoActive) showDemoTouchHint(event) else handleTouch(view, event)
             true
         }
     }
@@ -749,18 +778,160 @@ class MainActivity : AppCompatActivity() {
             binding.showAdvanced.text = if (advancedVisible) "Hide Advanced Settings" else "Advanced Settings"
         }
 
+        binding.demoButton.setOnClickListener { startDemo() }
+        binding.watchVideoButton.setOnClickListener { showHowItWorksVideo() }
+        binding.getMacAppLink.setOnClickListener {
+            try {
+                startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(MAC_APP_URL)))
+            } catch (_: Exception) {
+                showError("Open $MAC_APP_URL in a browser to download the Mac app.")
+            }
+        }
+        binding.reportProblemLink.setOnClickListener {
+            try {
+                startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(REPORT_PROBLEM_URL)))
+            } catch (_: Exception) {
+                showError("Open $REPORT_PROBLEM_URL in a browser to report a problem.")
+            }
+        }
+
         // Initial status
         updateStatus("Ready to connect")
     }
 
+    // ==================== Demo Mode ====================
+
+    private fun startDemo() {
+        if (demoActive || isConnected) return
+        val player =
+            try {
+                DemoPlayer(applicationContext) { videoDecoder }
+            } catch (e: Exception) {
+                mainDiag("Demo load failed: ${e.message}")
+                showError("Could not start the demo: ${e.message}")
+                return
+            }
+        mainDiag("Demo started")
+        demoActive = true
+        demoTouchHintShown = false
+        // Cancel any in-flight connection attempt (USB connect or wireless
+        // auto-reconnect) so its callbacks can't feed real frames into the demo
+        // decoder or flip the UI to "connected" mid-demo.
+        streamClient?.disconnect()
+        streamClient = null
+        videoDecoder?.release()
+        videoDecoder = null
+
+        displayWidth = DemoPlayer.WIDTH
+        displayHeight = DemoPlayer.HEIGHT
+        desktopWidth = 0
+        desktopHeight = 0
+        displayRotation = 0
+        displayFlipHorizontal = false
+        displayFlipVertical = false
+
+        binding.settingsPanel.visibility = View.GONE
+        applySettingsButtonVisibility()
+        restoreSettingsButtonPosition()
+        enableFullscreenMode()
+        applyRotation(0, false, false)
+        // The clip is a real 16:10 extended display: letterbox it instead of stretching
+        // UI text on phones (a real session sizes the Mac display to the tablet).
+        setSurfaceAspect("${DemoPlayer.WIDTH}:${DemoPlayer.HEIGHT}")
+        updateResolutionOverlay()
+        binding.resolutionText.append(" (demo)")
+        binding.latencyText.text = "—"
+        updateOverlayVisibility(prefs.showStatsOverlay)
+        initializeDecoderForCurrentSurface()
+
+        player.onStats = { fps, mbps ->
+            runOnUiThread {
+                binding.fpsText.text = String.format("%.1f", fps)
+                binding.bitrateText.text = String.format("%.1f Mbps", mbps)
+            }
+        }
+        demoPlayer = player
+        player.start()
+        android.widget.Toast
+            .makeText(this, "Demo mode — open Settings (⚙) or press Back to exit", android.widget.Toast.LENGTH_LONG)
+            .show()
+    }
+
+    private fun stopDemo() {
+        if (!demoActive) return
+        mainDiag("Demo stopped")
+        demoPlayer?.stop()
+        demoPlayer = null
+        demoActive = false
+        videoDecoder?.release()
+        videoDecoder = null
+        displayWidth = 0
+        displayHeight = 0
+
+        binding.settingsButton.visibility = View.GONE
+        binding.statusBar.visibility = View.GONE
+        binding.settingsPanel.visibility = View.VISIBLE
+        setSurfaceAspect(null)
+        // Recreate the surface so the last demo frame doesn't linger behind the panel
+        binding.surfaceView.visibility = View.GONE
+        binding.surfaceView.post { binding.surfaceView.visibility = View.VISIBLE }
+        disableFullscreenMode()
+        resetOrientationToSensor()
+    }
+
+    private fun setSurfaceAspect(ratio: String?) {
+        val params = binding.surfaceView.layoutParams as ConstraintLayout.LayoutParams
+        params.dimensionRatio = ratio
+        binding.surfaceView.layoutParams = params
+    }
+
+    /** Plays the bundled recording of a real Mac + phone session, looping, full screen. */
+    private fun showHowItWorksVideo() {
+        val dialog = Dialog(this, android.R.style.Theme_Black_NoTitleBar_Fullscreen)
+        dialog.setContentView(R.layout.dialog_how_it_works)
+        val video = dialog.findViewById<android.widget.VideoView>(R.id.howItWorksVideo)
+        video.setVideoURI(android.net.Uri.parse("android.resource://$packageName/${R.raw.how_it_works}"))
+        video.setOnPreparedListener { player ->
+            player.isLooping = true
+            video.start()
+        }
+        dialog.findViewById<View>(R.id.closeVideoButton).setOnClickListener { dialog.dismiss() }
+        dialog.setOnDismissListener { video.stopPlayback() }
+        dialog.show()
+    }
+
+    /** Touch has nothing to control in demo mode — say what it would do instead. */
+    private fun showDemoTouchHint(event: MotionEvent) {
+        if (event.actionMasked != MotionEvent.ACTION_UP || demoTouchHintShown) return
+        demoTouchHintShown = true
+        android.widget.Toast
+            .makeText(
+                this,
+                "Demo mode — when connected, touching here clicks, drags and scrolls on your Mac.",
+                android.widget.Toast.LENGTH_LONG,
+            ).show()
+    }
+
     private fun showError(message: String) {
         runOnUiThread {
-            android.app.AlertDialog
-                .Builder(this)
-                .setTitle("Connection Error")
-                .setMessage(message)
-                .setPositiveButton("OK", null)
-                .show()
+            // connect() fails on a background thread, often seconds after the user rotated
+            // the tablet or left the app. By then this Activity is destroyed and Dialog.show()
+            // throws BadTokenException (top crash on 1.0.2). The status line already says
+            // "Connection failed", so just drop the dialog.
+            if (isFinishing || isDestroyed) {
+                mainDiag("showError skipped — activity gone: $message")
+                return@runOnUiThread
+            }
+            try {
+                android.app.AlertDialog
+                    .Builder(this)
+                    .setTitle("Connection Error")
+                    .setMessage(message)
+                    .setPositiveButton("OK", null)
+                    .show()
+            } catch (e: android.view.WindowManager.BadTokenException) {
+                mainDiag("showError failed — no window token: ${e.message}")
+            }
         }
     }
 
@@ -787,14 +958,11 @@ class MainActivity : AppCompatActivity() {
                         var newX = event.rawX + overlayDx
                         var newY = event.rawY + overlayDy
 
-                        // Get screen bounds
+                        // Constrain to the parent. The overlay can be wider than a
+                        // phone in portrait; OverlayBounds pins it instead of throwing.
                         val parent = view.parent as View
-                        val maxX = parent.width - view.width.toFloat()
-                        val maxY = parent.height - view.height.toFloat()
-
-                        // Constrain to screen bounds
-                        newX = newX.coerceIn(0f, maxX)
-                        newY = newY.coerceIn(0f, maxY)
+                        newX = OverlayBounds.clamp(newX, parent.width, view.width)
+                        newY = OverlayBounds.clamp(newY, parent.height, view.height)
 
                         view
                             .animate()
@@ -848,7 +1016,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateOverlayVisibility(show: Boolean) {
-        if (streamClient != null && show) {
+        if ((streamClient != null || demoActive) && show) {
             binding.statusBar.visibility = View.VISIBLE
             // Restore position when showing
             val x = prefs.overlayX
@@ -883,7 +1051,8 @@ class MainActivity : AppCompatActivity() {
 
         // Only show Disconnect when actually streaming. Otherwise the button is
         // a no-op and confuses users into clicking it twice.
-        disconnectButton.visibility = if (isConnected) View.VISIBLE else View.GONE
+        disconnectButton.visibility = if (isStreamingUi) View.VISIBLE else View.GONE
+        if (demoActive) (disconnectButton as TextView).text = "Exit demo"
 
         // Position buttons (8 directions)
         val cornerTopLeft = view.findViewById<MaterialButton>(R.id.cornerTopLeft)
@@ -936,7 +1105,7 @@ class MainActivity : AppCompatActivity() {
 
         hideSettingsSwitch.setOnCheckedChangeListener { _, isChecked ->
             prefs.hideSettingsButton = isChecked
-            if (isConnected) {
+            if (isStreamingUi) {
                 applySettingsButtonVisibility()
             }
             if (isChecked) {
@@ -1026,7 +1195,7 @@ class MainActivity : AppCompatActivity() {
 
         disconnectButton.setOnClickListener {
             dialog.dismiss()
-            disconnect()
+            if (demoActive) stopDemo() else disconnect()
         }
 
         closeButton.setOnClickListener {
@@ -1060,10 +1229,12 @@ class MainActivity : AppCompatActivity() {
             this,
             object : androidx.activity.OnBackPressedCallback(true) {
                 override fun handleOnBackPressed() {
-                    if (isConnected && prefs.hideSettingsButton &&
+                    if (isStreamingUi && prefs.hideSettingsButton &&
                         binding.settingsButton.visibility != View.VISIBLE
                     ) {
                         revealSettingsButtonTemporarily()
+                    } else if (demoActive) {
+                        stopDemo()
                     } else {
                         isEnabled = false
                         onBackPressedDispatcher.onBackPressed()
@@ -1083,7 +1254,7 @@ class MainActivity : AppCompatActivity() {
     private val revealHandler = Handler(Looper.getMainLooper())
     private val hideSettingsButtonRunnable =
         Runnable {
-            if (isConnected && prefs.hideSettingsButton) {
+            if (isStreamingUi && prefs.hideSettingsButton) {
                 binding.settingsButton.visibility = View.GONE
             }
         }
@@ -1258,6 +1429,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Stream size first, since that is what the decoder and every other stat in this overlay
+     * describe. The desktop size is appended only when it differs, so a scaled HiDPI desktop is
+     * visible rather than silently standing in for the resolution actually being sent.
+     */
+    private fun updateResolutionOverlay() {
+        if (displayWidth <= 0 || displayHeight <= 0) return
+        val stream = "${displayWidth}x$displayHeight"
+        val differs = desktopWidth > 0 && (desktopWidth != displayWidth || desktopHeight != displayHeight)
+        binding.resolutionText.text =
+            if (differs) "$stream (desktop ${desktopWidth}x$desktopHeight)" else stream
+    }
+
     private fun shouldUseTextureView(): Boolean = displayFlipHorizontal || displayFlipVertical
 
     private fun activeVideoSurface(): Pair<Surface, Boolean>? {
@@ -1276,7 +1460,7 @@ class MainActivity : AppCompatActivity() {
         // AVC-only device: an HEVC decoder can never decode the H.264 stream
         // the Mac will send — defer until codecSelected arrives, then
         // onStreamCodecSelected initializes with the correct mime.
-        if (!CodecCapabilities.hasHevcDecoder && streamClient?.codecNegotiated != true) {
+        if (!demoActive && !CodecCapabilities.hasHevcDecoder && streamClient?.codecNegotiated != true) {
             mainDiag("initializeDecoder deferred — AVC-only device awaiting codec negotiation")
             return
         }
@@ -1289,8 +1473,14 @@ class MainActivity : AppCompatActivity() {
             }
 
         if (videoDecoder != null && decoderUsingTextureView == useTextureView) {
-            videoDecoder?.updateResolution(displayWidth, displayHeight)
-            return
+            try {
+                videoDecoder?.updateResolution(displayWidth, displayHeight)
+                return
+            } catch (e: Exception) {
+                // Restarting the codec in place failed (crash on 1.0.1): build a fresh
+                // decoder below instead, which reports failure in the UI rather than crashing.
+                mainDiag("Decoder resize FAILED: ${e.message} — recreating")
+            }
         }
 
         videoDecoder?.release()
@@ -1310,7 +1500,7 @@ class MainActivity : AppCompatActivity() {
                     windowManager.defaultDisplay
                 }
             val mime =
-                if (streamClient?.streamCodecIsHevc == false) {
+                if (demoActive || streamClient?.streamCodecIsHevc == false) {
                     MediaFormat.MIMETYPE_VIDEO_AVC
                 } else {
                     MediaFormat.MIMETYPE_VIDEO_HEVC
@@ -1326,7 +1516,18 @@ class MainActivity : AppCompatActivity() {
                 // Black screen with live stats: tell the user why instead of
                 // staying silent (issue #41). Toast renders above the (black)
                 // SurfaceView; the settings panel is hidden while streaming.
-                val cap = CodecCapabilities.maxDecodeSize(mime)
+                // The sustainable size, not the decoder's advertised one — that is typically far
+                // above anything it can really output, which made this message actively misleading.
+                val panel = PanelGeometry.of(displayObj)
+                val cap =
+                    panel?.let {
+                        CodecCapabilities.maxStreamSize(
+                            mime,
+                            it.width,
+                            it.height,
+                            CodecCapabilities.REFERENCE_FPS,
+                        )
+                    }
                 runOnUiThread {
                     val capText = cap?.let { " (max ~${it.first}×${it.second})" } ?: ""
                     android.widget.Toast
@@ -1334,7 +1535,7 @@ class MainActivity : AppCompatActivity() {
                             this,
                             "No video output — the stream resolution may exceed " +
                                 "this tablet's decoder limit$capText. " +
-                                "Lower the resolution or disable HiDPI on the Mac.",
+                                "Lower the resolution or refresh rate, or disable HiDPI, on the Mac.",
                             android.widget.Toast.LENGTH_LONG,
                         ).show()
                 }
@@ -1348,6 +1549,16 @@ class MainActivity : AppCompatActivity() {
             log("❌ Failed to initialize decoder: ${e.message}")
             runOnUiThread {
                 updateStatus("Video decoder failed: ${e.message}")
+                // The status text sits in the settings panel, hidden while streaming —
+                // without this the user would just see a black screen.
+                if (isStreamingUi) {
+                    android.widget.Toast
+                        .makeText(
+                            this,
+                            "Video decoder failed — disconnect and reconnect to retry.",
+                            android.widget.Toast.LENGTH_LONG,
+                        ).show()
+                }
             }
         }
     }
@@ -1383,6 +1594,7 @@ class MainActivity : AppCompatActivity() {
         streamClient?.onConnectionStatus = { connected ->
             runOnUiThread {
                 isConnected = connected
+                reviewPrompter.onConnectionChanged(connected)
                 if (connected) {
                     updateStatus("Connected - Streaming active")
                 } else {
@@ -1439,6 +1651,12 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        streamClient?.onDesktopSize = { w, h ->
+            desktopWidth = w
+            desktopHeight = h
+            runOnUiThread { updateResolutionOverlay() }
+        }
+
         streamClient?.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
 
         streamClient?.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
@@ -1450,7 +1668,7 @@ class MainActivity : AppCompatActivity() {
             displayFlipHorizontal = flipHorizontal
             displayFlipVertical = flipVertical
             runOnUiThread {
-                binding.resolutionText.text = "${width}x$height"
+                updateResolutionOverlay()
                 applyRotation(rotation, flipHorizontal, flipVertical)
                 initializeDecoderForCurrentSurface()
             }
@@ -1465,6 +1683,118 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Code pairing (issue #35): manual host/port/code entry for tablets without
+     * a camera. On success the Mac issues the real token and we connect through
+     * the same path as a QR scan.
+     */
+    private fun showCodePairingDialog() {
+        val view = layoutInflater.inflate(R.layout.dialog_code_pairing, null)
+        val hostField = view.findViewById<android.widget.EditText>(R.id.codePairHost)
+        val portField = view.findViewById<android.widget.EditText>(R.id.codePairPort)
+        val codeField = view.findViewById<android.widget.EditText>(R.id.codePairCode)
+        val errorText = view.findViewById<android.widget.TextView>(R.id.codePairError)
+
+        // Re-pair convenience: prefill the last paired Mac so only the fresh
+        // code needs typing.
+        pairedHostStorage.load()?.let { cached ->
+            hostField.setText(cached.host)
+            portField.setText(cached.port.toString())
+        }
+
+        val dialog =
+            com.google.android.material.dialog.MaterialAlertDialogBuilder(this)
+                .setTitle("Pair with code")
+                .setView(view)
+                .setPositiveButton("Pair", null) // listener installed below so it doesn't auto-dismiss
+                .setNegativeButton("Cancel", null)
+                .create()
+
+        dialog.setOnShowListener {
+            val pairButton = dialog.getButton(android.app.AlertDialog.BUTTON_POSITIVE)
+            pairButton.setOnClickListener {
+                val host = hostField.text.toString().trim()
+                val port = portField.text.toString().trim().toIntOrNull()
+                val code = codeField.text.toString().filter { it.isDigit() }
+
+                errorText.visibility = View.GONE
+                when {
+                    host.isEmpty() -> {
+                        errorText.text = "Enter the Mac's address (shown as \"Listening\" under the QR)."
+                        errorText.visibility = View.VISIBLE
+                        return@setOnClickListener
+                    }
+                    port == null || port !in 1..65535 -> {
+                        errorText.text = "Port must be between 1 and 65535."
+                        errorText.visibility = View.VISIBLE
+                        return@setOnClickListener
+                    }
+                    code.length != AuthHandshake.PAIR_CODE_LEN -> {
+                        errorText.text = "The code is ${AuthHandshake.PAIR_CODE_LEN} digits."
+                        errorText.visibility = View.VISIBLE
+                        return@setOnClickListener
+                    }
+                }
+                pairButton.isEnabled = false
+                pairButton.text = "Pairing…"
+
+                fun showPairError(message: String) {
+                    runOnUiThread {
+                        pairButton.isEnabled = true
+                        pairButton.text = "Pair"
+                        errorText.text = message
+                        errorText.visibility = View.VISIBLE
+                    }
+                }
+
+                val deviceName = WirelessTabController.defaultDeviceName(this@MainActivity)
+                pairingJob =
+                    lifecycleScope.launch(Dispatchers.IO) {
+                        try {
+                            val client = StreamClient(host, port!!, applicationContext)
+                            val result = client.pairWithCode(code, deviceName)
+                            // Dialog dismissed mid-flight (Cancel/back): drop the
+                            // token instead of silently connecting.
+                            ensureActive()
+                            runOnUiThread {
+                                dialog.dismiss()
+                                wirelessController.onCodePairComplete(host, port, result.token, result.macName)
+                            }
+                        } catch (e: StreamClient.PairingError) {
+                            showPairError(
+                                when (e) {
+                                    is StreamClient.PairingError.CodeRejected ->
+                                        "Code not accepted. Codes change after each use — " +
+                                            "check the Mac for the current one."
+                                    is StreamClient.PairingError.HostTooOld ->
+                                        "Update Side Screen on the Mac to use code pairing."
+                                },
+                            )
+                        } catch (e: StreamClient.WirelessConnectError) {
+                            showPairError(
+                                when (e) {
+                                    is StreamClient.WirelessConnectError.NetworkUnreachable ->
+                                        "No response from $host:$port. Check both devices are " +
+                                            "on the same WiFi and the Mac app is running."
+                                    else -> "Connection error — try again."
+                                },
+                            )
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            log("Code pairing failed unexpectedly: ${e.message}")
+                            showPairError("Pairing failed — try again.")
+                        }
+                    }
+            }
+        }
+        dialog.setOnDismissListener {
+            pairingJob?.cancel()
+            pairingJob = null
+        }
+        dialog.show()
+    }
+
     private fun connectWireless(
         host: String,
         port: Int,
@@ -1475,6 +1805,7 @@ class MainActivity : AppCompatActivity() {
         // Same reasoning as connect(): claim the session before any socket work.
         sessionActive = true
         stopChecklistUpdates()
+        stopDemo() // a real connection (incl. wireless auto-reconnect) takes over the decoder
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting wirelessly to $host:$port...")
@@ -1507,11 +1838,12 @@ class MainActivity : AppCompatActivity() {
         // connection on the Mac before it finishes handshaking.
         sessionActive = true
         stopChecklistUpdates()
+        stopDemo()
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 log("Connecting to $host:$port...")
 
-                streamClient = StreamClient(host, port)
+                streamClient = StreamClient(host, port, applicationContext)
                 streamClient?.onFrameReceived = { frameData, frameSize, timestamp, isKeyframe ->
                     val dec = videoDecoder
                     if (dec != null) {
@@ -1546,6 +1878,7 @@ class MainActivity : AppCompatActivity() {
                     runOnUiThread {
                         // Update connection state flag
                         isConnected = connected
+                        reviewPrompter.onConnectionChanged(connected)
 
                         if (connected) {
                             updateStatus("Connected - Streaming active")
@@ -1604,6 +1937,12 @@ class MainActivity : AppCompatActivity() {
 
                 streamClient?.onCodecSelected = { isHevc -> onStreamCodecSelected(isHevc) }
 
+                streamClient?.onDesktopSize = { w, h ->
+                    desktopWidth = w
+                    desktopHeight = h
+                    runOnUiThread { updateResolutionOverlay() }
+                }
+
                 streamClient?.onDisplaySize = { width, height, rotation, flipHorizontal, flipVertical ->
                     mainDiag("onDisplaySize: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
                     warnIfAvcOnlyWithoutNegotiation()
@@ -1614,7 +1953,7 @@ class MainActivity : AppCompatActivity() {
                     displayFlipVertical = flipVertical
 
                     runOnUiThread {
-                        binding.resolutionText.text = "${width}x$height"
+                        updateResolutionOverlay()
                         applyRotation(rotation, flipHorizontal, flipVertical)
                         initializeDecoderForCurrentSurface()
                     }
@@ -1681,6 +2020,8 @@ class MainActivity : AppCompatActivity() {
         // Reset display config so next connect defers decoder init until config arrives
         displayWidth = 0
         displayHeight = 0
+        desktopWidth = 0
+        desktopHeight = 0
         displayFlipHorizontal = false
         displayFlipVertical = false
         runOnUiThread {
@@ -1714,6 +2055,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun cleanup() {
         try {
+            stopDemo()
             disconnect()
             videoDecoder?.release()
             videoDecoder = null
@@ -1846,6 +2188,12 @@ class MainActivity : AppCompatActivity() {
             val lines = current.split("\n").takeLast(5)
             binding.logText.text = (lines + message).joinToString("\n")
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Only nudge about updates while idle — never over a live stream or the demo.
+        if (!isStreamingUi) appUpdater.checkForUpdate()
     }
 
     override fun onDestroy() {

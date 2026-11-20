@@ -122,17 +122,8 @@ Run a Mac with no display of its own — a Mac Studio or Mini on the go, or a la
 
 ## Installation
 
-Download the latest release from [**GitHub Releases**](https://github.com/tranvuongquocdat/SideScreen/releases):
-
-- **macOS**: Download `.dmg`, open it, drag Side Screen to Applications
-- **Android**: Download `.apk`, install on your tablet (enable "Unknown sources" if needed). Port forwarding is handled automatically by the Mac app.
-
-> **⚠️ macOS Gatekeeper**
-> If macOS says the app is "damaged", open Terminal and run:
-> ```bash
-> sudo xattr -cr /Applications/SideScreen.app
-> ```
-> Then open the app again. This is needed because the app is not notarized with an Apple Developer certificate.
+- **Android**: [Get it on Google Play](https://play.google.com/store/apps/details?id=com.sidescreen.app) — updates install automatically.
+- **macOS**: Download the `.dmg` from [**GitHub Releases**](https://github.com/tranvuongquocdat/SideScreen/releases), open it, drag Side Screen to Applications. The app is signed and notarized by Apple, and checks for updates on its own. Port forwarding over USB is handled automatically by the Mac app.
 
 > **⚠️ ADB Required**
 > The Mac app needs `adb` to communicate with your Android device. If the app doesn't show "Running" after launch, you likely need to install ADB:
@@ -213,11 +204,7 @@ The Mac is muted only while a tablet is connected, and its previous volume is re
 <details>
 <summary><strong>"SideScreen is damaged" on macOS</strong></summary>
 
-This happens because the app is not notarized by Apple. Run this command to fix it:
-```bash
-sudo xattr -cr /Applications/SideScreen.app
-```
-Then open the app again.
+Versions before 1.1.0 were not notarized. Update to the latest release from [GitHub Releases](https://github.com/tranvuongquocdat/SideScreen/releases), which opens without any workaround. If you must keep an old version, run `sudo xattr -cr /Applications/SideScreen.app` once.
 </details>
 
 <details>
@@ -248,6 +235,12 @@ The Mac app sets up `adb reverse` automatically when streaming starts. If it sti
 <summary><strong>Wireless: "Re-pair required" after restart / reinstall</strong></summary>
 
 The Mac's auth token resets when you click **Reset Token (forget all)** or reinstall the app. Tap **Scan QR Code** on the Android client and scan the new QR shown on the Mac.
+</details>
+
+<details>
+<summary><strong>Tablet goes black whenever an app is fullscreen on the Mac</strong></summary>
+
+This is macOS, not the stream: with **"Displays have separate Spaces"** turned off, macOS blanks every other display — including the virtual one the tablet shows — as soon as any app enters fullscreen. Turn it on in **System Settings → Desktop & Dock → Mission Control → Displays have separate Spaces**, then log out and back in. The Mac app shows a warning in its Status panel when this setting is off.
 </details>
 
 <details>

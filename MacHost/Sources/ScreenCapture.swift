@@ -152,21 +152,27 @@ class ScreenCapture {
     /// Codec for the current encode session. Switching restarts the stream.
     private(set) var codec: StreamCodec = .hevc
 
-    /// Decoder ceiling reported by the connected client (issue #41). Nil for
-    /// legacy clients that report nothing.
+    /// Largest frame the connected client wants to receive (issue #41): the
+    /// smaller of its panel size and what its decoder can sustain at the panel
+    /// refresh rate. Nil for legacy clients that report nothing.
     private var clientDecodeLimit: (width: Int, height: Int)?
+    /// The same ceiling measured per frame rate (type 14), when the client sent it.
+    private var clientDecodeLimitTable: [Int: (width: Int, height: Int)]?
 
     /// Encode dimensions for a codec: physical display pixels, clamped to the
-    /// client's reported decoder limit when known, else to the conservative
-    /// AVC floor when streaming H.264. SCStream/CGDisplayStream scale the
-    /// capture into this size, so no virtual-display change is needed.
+    /// client's reported ceiling when known, else to the conservative AVC floor
+    /// when streaming H.264. SCStream/CGDisplayStream scale the capture into
+    /// this size, so no virtual-display change is needed.
+    ///
+    /// This is what makes HiDPI usable on a tablet: macOS renders at 2x, SCStream
+    /// downsamples to the client's ceiling before encode, and the client decodes
+    /// a frame it can sustain — sharper than a 1x capture of the same size.
     func encodeSize(for codec: StreamCodec) -> (width: Int, height: Int) {
         let phys = (displayWidth, displayHeight)
         // A reported limit is authoritative for both codecs: it is what the
         // client's own MediaCodec claims it can decode.
-        if let limit = clientDecodeLimit {
-            return CodecLimits.clamp(width: phys.0, height: phys.1,
-                                     maxWidth: limit.width, maxHeight: limit.height)
+        if let budget = CodecLimits.budget(limit: clientDecodeLimit, table: clientDecodeLimitTable, forFps: refreshRate) {
+            return CodecLimits.clampToClientLimit(width: phys.0, height: phys.1, limit: budget)
         }
         switch codec {
         case .hevc: return phys
@@ -230,8 +236,8 @@ class ScreenCapture {
         // Defensive: stopStreaming() already unregisters and releases, but make
         // sure a dropped instance never leaves observer tokens behind or keeps
         // holding the display-sleep assertion for the rest of the process.
-        releaseDisplaySleepAssertion()
         unregisterWakeObservers()
+        releaseDisplaySleepAssertion()
     }
 
     private func handleWake() {
@@ -362,7 +368,14 @@ class ScreenCapture {
         config.width = width
         config.height = height
         config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        // Video-range (16-235) rather than full-range (0-255). VideoToolbox
+        // derives the bitstream's VUI full_range_flag from the pixel format,
+        // and several Android vendor display paths (Xiaomi/HyperOS among
+        // them) apply a limited-range YUV->RGB matrix regardless of that
+        // flag, which clips full-range highlights to white and crushes
+        // shadows (#55). Limited range is what every decoder/GPU assumes by
+        // default, so it renders identically everywhere.
+        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         config.showsCursor = true
         config.queueDepth = 4
         config.capturesAudio = captureAudio
@@ -772,7 +785,8 @@ class ScreenCapture {
 
         debugLog("CGDisplayStream fallback — display \(displayID) (\(width)x\(height))")
 
-        let pixelFormat = Int32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange)
+        // Video-range to match the SCStream path (see #55 note above).
+        let pixelFormat = Int32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
         let queue = DispatchQueue(label: "com.sidescreen.cgdisplaystream", qos: .userInteractive)
 
         // Without kCGDisplayStreamShowCursor the fallback stream never
@@ -843,7 +857,11 @@ class ScreenCapture {
     /// client's reported decoder ceiling. Rebuilds the encoder mid-session
     /// when either changes the encode setup (a codec switch, or a ceiling
     /// that alters the encode dimensions — issue #41).
-    func negotiate(codec newCodec: StreamCodec, clientLimit: (width: Int, height: Int)?) {
+    func negotiate(
+        codec newCodec: StreamCodec,
+        clientLimit: (width: Int, height: Int)?,
+        clientLimitTable: [Int: (width: Int, height: Int)]? = nil
+    ) {
         let sizeBefore = encodeSize(for: codec)
         let codecChanged = newCodec != codec
         if codecChanged {
@@ -851,13 +869,15 @@ class ScreenCapture {
         }
         codec = newCodec
         clientDecodeLimit = clientLimit
+        clientDecodeLimitTable = clientLimitTable
 
         guard encoder != nil else { return }  // not streaming yet; startStreaming will pick both up
 
         let sizeAfter = encodeSize(for: newCodec)
         guard codecChanged || sizeBefore != sizeAfter else { return }
         if sizeBefore != sizeAfter {
-            let limitDesc = clientLimit.map { "\($0.width)x\($0.height)" } ?? "none"
+            let budget = CodecLimits.budget(limit: clientLimit, table: clientLimitTable, forFps: refreshRate)
+            let limitDesc = budget.map { "\($0.width)x\($0.height) at \(refreshRate) fps" } ?? "none"
             debugLog("Encode size \(sizeBefore.width)x\(sizeBefore.height) -> \(sizeAfter.width)x\(sizeAfter.height) (client decoder limit: \(limitDesc))")
         }
         rebuildEncoder()

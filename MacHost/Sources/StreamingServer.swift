@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import os
 
 private enum WireMessage {
     static let legacyVideoFrame: UInt8 = 0
@@ -21,14 +22,36 @@ private enum WireMessage {
     /// #41). Every payload byte has the high bit set, so old hosts that
     /// consume unknown types byte-by-byte skip the payload harmlessly.
     static let clientDecoderLimits: UInt8 = 11
+    /// Client→server, payload-free: "I understand desktopGeometry, and I read
+    /// displayConfig as the encoded stream size."
+    static let clientSupportsDesktopGeometry: UInt8 = 12
+    /// Server→client, 8-byte payload: the logical desktop size, for display
+    /// only. Sent ONLY to clients that sent clientSupportsDesktopGeometry —
+    /// older clients disconnect on unknown message types.
+    static let desktopGeometry: UInt8 = 13
+    /// Client→server, 12-byte payload: the client's sustainable decode size
+    /// at each CodecLimits.tableFps rate (three 4-byte sizes in the type-11
+    /// encoding, every byte high-bit set). Sent after type 11, which older
+    /// hosts still read; hosts that know this type prefer it (issue #78).
+    static let clientDecoderLimitTable: UInt8 = 14
     /// Client→server, payload-free: "this device can play streamed audio".
     /// Sent BEFORE type 8, like types 9 and 11, because type 8 can trigger the
     /// server's early protocol finish.
-    static let clientSupportsAudio: UInt8 = 12
+    static let clientSupportsAudio: UInt8 = 15
     /// Server→client, `[length: 4 BE][pcm]`. 48 kHz stereo Int16 LE. Sent ONLY
     /// to clients that sent clientSupportsAudio — old clients disconnect on
     /// unknown message types, so this must never be sent unsolicited.
-    static let audioFrame: UInt8 = 13
+    static let audioFrame: UInt8 = 16
+    // 17 is reserved.
+    /// Client→server, variable payload (DeviceIdentityCodec, every byte
+    /// high-bit set): the tablet's stable per-install UUID and name. Sent
+    /// BEFORE type 8, so the host knows which profile to apply before the
+    /// display config goes out.
+    static let clientIdentity: UInt8 = 18
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }
 
 private extension NWEndpoint {
@@ -44,6 +67,102 @@ private extension NWEndpoint {
         default:
             return false
         }
+    }
+}
+
+enum StreamingServerStartError: LocalizedError {
+    case listenerFailed(port: UInt16, underlying: Error)
+    case cancelledBeforeReady(port: UInt16)
+    case startupTimedOut(port: UInt16, lastWaitingError: Error?)
+
+    var errorDescription: String? {
+        switch self {
+        case .listenerFailed(let port, let underlying):
+            return "Could not listen on port \(port): \(underlying.localizedDescription)"
+        case .cancelledBeforeReady(let port):
+            return "Server startup on port \(port) was cancelled before the listener became ready."
+        case .startupTimedOut(let port, let lastWaitingError):
+            let detail = lastWaitingError.map { " Last listener error: \($0.localizedDescription)" } ?? ""
+            return "Timed out while waiting for the server to listen on port \(port).\(detail)"
+        }
+    }
+}
+
+/// Bridges NWListener's state callback to async startup without risking a
+/// leaked or double-resumed continuation. The listener may publish a state
+/// before `wait()` installs its continuation, so the first result is cached.
+final class ListenerStartupGate: @unchecked Sendable {
+    private enum State {
+        case pending
+        case waiting(CheckedContinuation<Void, Error>)
+        case completed(Result<Void, Error>)
+    }
+
+    private let lock = NSLock()
+    private var state: State = .pending
+    private var lastWaitingError: Error?
+
+    func wait() async throws {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let completedResult: Result<Void, Error>?
+                lock.lock()
+                switch state {
+                case .pending:
+                    state = .waiting(continuation)
+                    completedResult = nil
+                case .completed(let result):
+                    completedResult = result
+                case .waiting:
+                    // A StreamingServer has exactly one startup waiter.
+                    completedResult = .failure(
+                        NSError(
+                            domain: "StreamingServer",
+                            code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: "Server startup was awaited more than once."]
+                        )
+                    )
+                }
+                lock.unlock()
+
+                if let completedResult {
+                    continuation.resume(with: completedResult)
+                }
+            }
+        } onCancel: {
+            resolve(.failure(CancellationError()))
+        }
+    }
+
+    func noteWaitingError(_ error: Error) {
+        lock.lock()
+        lastWaitingError = error
+        lock.unlock()
+    }
+
+    func resolveTimeout(port: UInt16) {
+        lock.lock()
+        let waitingError = lastWaitingError
+        lock.unlock()
+        resolve(.failure(StreamingServerStartError.startupTimedOut(port: port, lastWaitingError: waitingError)))
+    }
+
+    func resolve(_ result: Result<Void, Error>) {
+        let continuation: CheckedContinuation<Void, Error>?
+        lock.lock()
+        switch state {
+        case .pending:
+            state = .completed(result)
+            continuation = nil
+        case .waiting(let waiter):
+            state = .completed(result)
+            continuation = waiter
+        case .completed:
+            continuation = nil
+        }
+        lock.unlock()
+
+        continuation?.resume(with: result)
     }
 }
 
@@ -72,6 +191,51 @@ class StreamingServer {
     var expectedAuthToken: Data?
     var onWirelessClientPaired: ((String) -> Void)?
 
+    /// Asked once per connection, on the network queue, right before the
+    /// display config would go out: `key` is the tablet's profile key (type 18
+    /// UUID, or `name:<handshake name>` for wireless apps that predate it;
+    /// nil for older USB apps). Return true to start streaming now. Return
+    /// false to hold the startup while the owner rebuilds the display for
+    /// this tablet's profile, then call `resumeProtocolStartup()`.
+    var onPrepareForClient: ((_ key: String?, _ name: String) -> Bool)?
+
+    // Code pairing (issue #35): when non-nil, a pre-auth "SSPC" request
+    // carrying this one-time code is answered with the real auth token, and
+    // the client reconnects through the normal SSWA handshake. Only honored
+    // while wireless mode is active (expectedAuthToken != nil).
+    //
+    // The code is written from the main thread (rotation) and read on
+    // networkQueue (validation), so state lives behind a lock — and
+    // validate-and-consume is a single critical section, so a code can never
+    // be redeemed twice and pipelined guesses can never exceed the attempt
+    // budget before the invalidation lands.
+    private struct PairingState {
+        var code: String?
+        var failedAttempts = 0
+    }
+
+    private let pairingStateLock = OSAllocatedUnfairLock(initialState: PairingState())
+    private static let maxPairingAttempts = 5
+
+    var expectedPairingCode: String? {
+        get { pairingStateLock.withLock { $0.code } }
+        set {
+            pairingStateLock.withLock { state in
+                state.code = newValue
+                state.failedAttempts = 0
+            }
+        }
+    }
+
+    var pairingMacName: String = "Mac"
+    /// Fired with the device name after a code was accepted and the token
+    /// issued. The code is already consumed (nil); the owner should install a
+    /// fresh one.
+    var onPairingSuccess: ((String) -> Void)?
+    /// Fired when the attempt budget is exhausted. The code is already
+    /// invalidated (nil); the owner should install a fresh one.
+    var onPairingCodeExhausted: (() -> Void)?
+
     private let frameQueue = DispatchQueue(label: "frameQueue", qos: .userInteractive)
     private let receiveQueue = DispatchQueue(label: "receiveQueue", qos: .userInteractive)
     private let audioQueue = DispatchQueue(label: "audioSendQueue", qos: .userInitiated)
@@ -91,7 +255,7 @@ class StreamingServer {
     private var waitingForSyncFrame = false
     private var clientSupportsFrameMetadata = false
     private var clientIsAvcOnly = false
-    /// The connection that sent clientSupportsAudio (type 12), or nil. Held as
+    /// The connection that sent clientSupportsAudio (type 15), or nil. Held as
     /// an identity rather than a Bool on purpose: a reconnect rewrites
     /// `connection` and the capability state as plain stores with no release
     /// fence, so a reader on the audio queue can see the new connection next to
@@ -100,14 +264,37 @@ class StreamingServer {
     private var audioClient: NWConnection?
     /// Max decode size reported by the connected client (issue #41).
     private(set) var clientDecodeLimits: (width: Int, height: Int)?
+    /// Sustainable decode size per frame rate (type 14), keyed by fps.
+    private(set) var clientDecodeLimitTable: [Int: (width: Int, height: Int)]?
+    /// Set when the client opts in via type 12. Gates desktopGeometry sends.
+    private var clientSupportsDesktopGeometry = false
+    /// Type 18 identity of the connected client, if it sent one.
+    private var clientIdentity: DeviceIdentity?
+    /// Name from the wireless auth handshake (nil over USB).
+    private var handshakeDeviceName: String?
+    /// onPrepareForClient already ran for this connection.
+    private var startupPrepared = false
+    /// Startup is waiting for the owner's resumeProtocolStartup().
+    private var startupHeld = false
+    /// Logical desktop size, reported alongside the encoded size for display.
+    private var desktopWidth = 0
+    private var desktopHeight = 0
     private var inputBuffer = Data()
 
     init(port: UInt16) {
         self.port = port
     }
 
-    func start() {
+    var boundPort: UInt16? {
+        listener?.port?.rawValue
+    }
+
+    func start(startupTimeout: TimeInterval = 10) async throws {
         isStopped = false
+        let startupGate = ListenerStartupGate()
+        let startupPort = port
+
+        let newListener: NWListener
         do {
             let params = NWParameters.tcp
             params.allowLocalEndpointReuse = true
@@ -117,26 +304,69 @@ class StreamingServer {
                 tcpOptions.noDelay = true  // Disable Nagle's algorithm
             }
 
-            listener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: port))
-
-            listener?.newConnectionHandler = { [weak self] newConnection in
-                self?.handleConnection(newConnection)
-            }
-
-            listener?.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    debugLog("TCP Server listening on port \(self.port)")
-                case .failed(let error):
-                    debugLog("Server failed: \(error)")
-                default:
-                    break
-                }
-            }
-
-            listener?.start(queue: networkQueue)
+            newListener = try NWListener(using: params, on: NWEndpoint.Port(integerLiteral: port))
         } catch {
             debugLog("Failed to start server: \(error)")
+            throw StreamingServerStartError.listenerFailed(port: port, underlying: error)
+        }
+
+        listener = newListener
+        newListener.newConnectionHandler = { [weak self] newConnection in
+            self?.handleConnection(newConnection)
+        }
+
+        newListener.stateUpdateHandler = { [weak self, startupGate] state in
+            guard let self else {
+                startupGate.resolve(.failure(CancellationError()))
+                return
+            }
+            switch state {
+            case .ready:
+                debugLog("TCP Server listening on port \(self.port)")
+                startupGate.resolve(.success(()))
+            case .waiting(let error):
+                debugLog("Server waiting to listen: \(error)")
+                if case .posix(.EADDRINUSE) = error {
+                    startupGate.resolve(
+                        .failure(StreamingServerStartError.listenerFailed(port: self.port, underlying: error))
+                    )
+                } else {
+                    startupGate.noteWaitingError(error)
+                }
+            case .failed(let error):
+                debugLog("Server failed: \(error)")
+                startupGate.resolve(
+                    .failure(StreamingServerStartError.listenerFailed(port: self.port, underlying: error))
+                )
+            case .cancelled:
+                startupGate.resolve(
+                    .failure(StreamingServerStartError.cancelledBeforeReady(port: self.port))
+                )
+            default:
+                break
+            }
+        }
+
+        let timeoutWorkItem = DispatchWorkItem { [startupGate] in
+            startupGate.resolveTimeout(port: startupPort)
+        }
+        networkQueue.asyncAfter(
+            deadline: .now() + max(0, startupTimeout),
+            execute: timeoutWorkItem
+        )
+        newListener.start(queue: networkQueue)
+
+        defer { timeoutWorkItem.cancel() }
+        do {
+            try await startupGate.wait()
+            try Task.checkCancellation()
+        } catch {
+            newListener.cancel()
+            if listener === newListener {
+                listener = nil
+            }
+            debugLog("Failed to start server: \(error)")
+            throw error
         }
     }
 
@@ -154,6 +384,12 @@ class StreamingServer {
         clientIsAvcOnly = false
         audioClient = nil
         clientDecodeLimits = nil
+        clientDecodeLimitTable = nil
+        clientSupportsDesktopGeometry = false
+        clientIdentity = nil
+        handshakeDeviceName = nil
+        startupPrepared = false
+        startupHeld = false
         waitingForSyncFrame = true
         inputBuffer.removeAll(keepingCapacity: true)
         connection = newConnection
@@ -206,7 +442,18 @@ class StreamingServer {
     }
 
     private func finishProtocolStartup(on conn: NWConnection) {
-        guard connection === conn, !isStopped, !connectionReady else { return }
+        guard connection === conn, !isStopped, !connectionReady, !startupHeld else { return }
+
+        if !startupPrepared, let prepare = onPrepareForClient {
+            startupPrepared = true
+            let key = clientIdentity?.id ?? DeviceProfileStore.fallbackKey(deviceName: handshakeDeviceName)
+            let name = clientIdentity?.name.nilIfEmpty ?? handshakeDeviceName ?? ""
+            if !prepare(key, name) {
+                startupHeld = true
+                debugLog("Startup held — applying this tablet's profile first")
+                return
+            }
+        }
 
         let codec: StreamCodec = clientIsAvcOnly ? .h264 : .hevc
         if clientIsAvcOnly {
@@ -244,32 +491,23 @@ class StreamingServer {
                 return
             }
             let prefixBytes = Array(prefix)
+            if Array(prefixBytes[0..<4]) == HandshakeCodec.pairingRequestMagic {
+                self.runPairingExchange(connection: conn, prefix: prefix)
+                return
+            }
             guard Array(prefixBytes[0..<4]) == HandshakeCodec.requestMagic else {
                 self.sendAuthResponse(conn, status: .invalidMagic, thenClose: true)
                 return
             }
-            let nameLen = Int(prefixBytes[36])
-            guard (1...64).contains(nameLen) else {
+            self.receiveNameSuffix(on: conn, prefix: prefix, onInvalid: {
                 self.sendAuthResponse(conn, status: .invalidName, thenClose: true)
-                return
-            }
-            // Read variable name.
-            conn.receive(minimumIncompleteLength: nameLen, maximumLength: nameLen) { nameData, _, _, error in
-                if let error = error {
-                    debugLog("Auth name read error: \(error)")
-                    conn.cancel()
-                    return
-                }
-                guard let nameData = nameData, nameData.count == nameLen else {
-                    self.sendAuthResponse(conn, status: .invalidName, thenClose: true)
-                    return
-                }
-                let full = prefix + nameData
+            }) { full in
                 do {
                     let parsed = try HandshakeCodec.parseRequest(full)
                     if WirelessAuth.validate(parsed.token, expected: expectedToken) {
                         debugLog("Wireless auth OK — device: \(parsed.deviceName)")
                         self.sendAuthResponse(conn, status: .ok, thenClose: false)
+                        self.handshakeDeviceName = parsed.deviceName
                         self.onWirelessClientPaired?(parsed.deviceName)
                         self.beginExistingProtocol(on: conn)
                     } else {
@@ -287,6 +525,105 @@ class StreamingServer {
         }
     }
 
+    /// Reads the variable `[name N]` tail shared by SSWA and SSPC requests and
+    /// hands back the full request bytes. `onInvalid` fires for a bad name
+    /// length or a short read; read errors cancel the connection.
+    private func receiveNameSuffix(
+        on conn: NWConnection,
+        prefix: Data,
+        onInvalid: @escaping () -> Void,
+        completion: @escaping (Data) -> Void
+    ) {
+        let nameLen = Int(Array(prefix)[36])
+        guard (1...64).contains(nameLen) else {
+            onInvalid()
+            return
+        }
+        conn.receive(minimumIncompleteLength: nameLen, maximumLength: nameLen) { nameData, _, _, error in
+            if let error = error {
+                debugLog("Handshake name read error: \(error)")
+                conn.cancel()
+                return
+            }
+            guard let nameData = nameData, nameData.count == nameLen else {
+                onInvalid()
+                return
+            }
+            completion(prefix + nameData)
+        }
+    }
+
+    /// Handles a pre-auth "SSPC" code-pairing request (issue #35). On a valid
+    /// one-time code, answers with the real 32-byte token + Mac name and closes;
+    /// the client then reconnects through the normal SSWA handshake.
+    private func runPairingExchange(connection conn: NWConnection, prefix: Data) {
+        receiveNameSuffix(on: conn, prefix: prefix, onInvalid: { [weak self] in
+            self?.sendPairingResponse(conn, status: .invalidCode)
+        }) { [weak self] full in
+            guard let self = self else { return }
+            do {
+                let parsed = try HandshakeCodec.parsePairingRequest(full)
+                switch self.consumePairingCode(candidate: parsed.code) {
+                case .issued(let token):
+                    debugLog("Pairing code accepted — issuing token to \(parsed.deviceName)")
+                    self.sendPairingResponse(conn, status: .ok, token: token)
+                    self.onPairingSuccess?(parsed.deviceName)
+                case .rejected:
+                    debugLog("Pairing code rejected")
+                    self.sendPairingResponse(conn, status: .invalidCode)
+                case .exhausted:
+                    debugLog("Pairing code rejected — attempt budget exhausted, invalidating code")
+                    self.sendPairingResponse(conn, status: .invalidCode)
+                    self.onPairingCodeExhausted?()
+                }
+            } catch {
+                // Malformed requests carry no code guess, so they don't touch
+                // the attempt budget.
+                debugLog("Malformed pairing request: \(error)")
+                self.sendPairingResponse(conn, status: .invalidCode)
+            }
+        }
+    }
+
+    private enum PairingOutcome {
+        case issued(Data)
+        case rejected
+        case exhausted
+    }
+
+    /// Single critical section for validate-and-consume: a correct guess nils
+    /// the code before the token leaves the lock, and the attempt counter is
+    /// bumped under the same lock — so neither double redemption nor
+    /// budget-overrun is possible however requests are pipelined.
+    private func consumePairingCode(candidate: String) -> PairingOutcome {
+        pairingStateLock.withLock { state in
+            guard let expected = state.code,
+                  let token = self.expectedAuthToken,
+                  PairingCode.validate(candidate, expected: expected) else {
+                guard state.code != nil else { return .rejected }
+                state.failedAttempts += 1
+                if state.failedAttempts >= Self.maxPairingAttempts {
+                    state.code = nil
+                    state.failedAttempts = 0
+                    return .exhausted
+                }
+                return .rejected
+            }
+            state.code = nil
+            state.failedAttempts = 0
+            return .issued(token)
+        }
+    }
+
+    private func sendPairingResponse(_ conn: NWConnection, status: PairingStatus, token: Data? = nil) {
+        let bytes = HandshakeCodec.encodePairingResponse(status: status, token: token, macName: pairingMacName)
+        conn.send(content: bytes, completion: .contentProcessed { _ in
+            // Pairing connections never stream: close after the reply either
+            // way. On success the client reconnects with the issued token.
+            conn.cancel()
+        })
+    }
+
     private func sendAuthResponse(_ conn: NWConnection, status: HandshakeStatus, thenClose: Bool) {
         let bytes = HandshakeCodec.encodeResponse(status: status)
         conn.send(content: bytes, completion: .contentProcessed { _ in
@@ -295,6 +632,13 @@ class StreamingServer {
                 conn.cancel()
             }
         })
+    }
+
+    /// The logical desktop the user picked. Purely informational: the client
+    /// must size its decoder from displayConfig, never from this.
+    func setDesktopSize(width: Int, height: Int) {
+        desktopWidth = width
+        desktopHeight = height
     }
 
     func setDisplaySize(width: Int, height: Int, rotation: Int = 0, flipHorizontal: Bool = false, flipVertical: Bool = false) {
@@ -324,6 +668,20 @@ class StreamingServer {
 
         connection.send(content: data, completion: .contentProcessed { _ in })
         debugLog("Sent display config: \(displayWidth)x\(displayHeight) @ \(rotation)°, h=\(flipHorizontal), v=\(flipVertical)")
+        sendDesktopGeometry()
+    }
+
+    /// Follows every display config so the two can never disagree on screen.
+    private func sendDesktopGeometry() {
+        guard clientSupportsDesktopGeometry, let connection = connection else { return }
+        guard desktopWidth > 0, desktopHeight > 0 else { return }
+
+        var data = Data()
+        data.append(WireMessage.desktopGeometry)
+        data.append(contentsOf: withUnsafeBytes(of: Int32(desktopWidth).bigEndian) { Data($0) })
+        data.append(contentsOf: withUnsafeBytes(of: Int32(desktopHeight).bigEndian) { Data($0) })
+        connection.send(content: data, completion: .contentProcessed { _ in })
+        debugLog("Sent desktop geometry: \(desktopWidth)x\(desktopHeight)")
     }
 
     private func startReceivingTouch() {
@@ -452,11 +810,107 @@ class StreamingServer {
                 if w >= 256 && h >= 256 {
                     clientDecodeLimits = (w, h)
                     debugLog("Client decoder limit: \(w)x\(h)")
+                    // Arrived after the 100 ms legacy grace already finished
+                    // startup (slow link, slow device): re-negotiate now so the
+                    // limit still takes effect instead of waiting for the next
+                    // restart. The handler re-sends the display config itself
+                    // when the encode size changes.
+                    if connectionReady {
+                        debugLog("Decoder limit arrived late — re-negotiating")
+                        let before = (displayWidth, displayHeight)
+                        onCodecNegotiated?(clientIsAvcOnly ? .h264 : .hevc)
+                        if (displayWidth, displayHeight) != before {
+                            sendDisplaySize()
+                        }
+                    }
+                }
+
+            case WireMessage.clientDecoderLimitTable:
+                // Type + 12 payload bytes: one (w, h) pair per
+                // CodecLimits.tableFps entry, in order, each in the type-11
+                // encoding. Sent BEFORE type 8, like type 11.
+                let payloadCount = 4 * CodecLimits.tableFps.count
+                guard inputBuffer.count >= 1 + payloadCount else { return }
+
+                let payload = (1...payloadCount).map { inputByte(at: $0) }
+                consumeInputBytes(1 + payloadCount)
+                guard payload.allSatisfy({ $0 & 0x80 != 0 }) else {
+                    debugLog("Malformed decoder-limit-table payload — ignoring")
+                    continue
+                }
+                var table: [Int: (width: Int, height: Int)] = [:]
+                for (i, fps) in CodecLimits.tableFps.enumerated() {
+                    let w = (Int(payload[4 * i] & 0x7F) << 7) | Int(payload[4 * i + 1] & 0x7F)
+                    let h = (Int(payload[4 * i + 2] & 0x7F) << 7) | Int(payload[4 * i + 3] & 0x7F)
+                    // Anything below QVGA-ish is a nonsense report — drop the whole table.
+                    guard w >= 256, h >= 256 else {
+                        table.removeAll()
+                        break
+                    }
+                    table[fps] = (w, h)
+                }
+                guard !table.isEmpty else {
+                    debugLog("Decoder limit table has a nonsense entry — ignoring")
+                    continue
+                }
+                clientDecodeLimitTable = table
+                let desc = CodecLimits.tableFps.compactMap { fps in table[fps].map { "\(fps)fps=\($0.width)x\($0.height)" } }
+                debugLog("Client decoder limit table: \(desc.joined(separator: ", "))")
+                if connectionReady {
+                    // Same late-arrival handling as type 11.
+                    debugLog("Decoder limit table arrived late — re-negotiating")
+                    let before = (displayWidth, displayHeight)
+                    onCodecNegotiated?(clientIsAvcOnly ? .h264 : .hevc)
+                    if (displayWidth, displayHeight) != before {
+                        sendDisplaySize()
+                    }
+                }
+
+            case WireMessage.clientSupportsDesktopGeometry:
+                // Payload-free opt-in (same convention as types 8 and 9), sent
+                // BEFORE type 8 so it lands before finishProtocolStartup runs.
+                consumeInputBytes(1)
+                if !clientSupportsDesktopGeometry {
+                    clientSupportsDesktopGeometry = true
+                    debugLog("Client reads displayConfig as the encoded size")
+                    // Late opt-in (after startup): the display config already
+                    // went out without geometry, so send it on its own.
+                    if connectionReady { sendDesktopGeometry() }
+                }
+
+            case WireMessage.clientIdentity:
+                // Type + DeviceIdentityCodec payload (32-byte UUID, count
+                // byte, 2×count name bytes; all high-bit). Sent BEFORE type 8
+                // so the identity is known when the profile is chosen.
+                guard inputBuffer.count >= 1 + DeviceIdentityCodec.headerLength else { return }
+                let countByte = inputByte(at: DeviceIdentityCodec.encodedUUIDLength + 1)
+                guard let payloadLength = DeviceIdentityCodec.payloadLength(countByte: countByte) else {
+                    debugLog("Malformed identity count byte — ignoring")
+                    consumeInputBytes(1)
+                    continue
+                }
+                guard inputBuffer.count >= 1 + payloadLength else { return }
+
+                let payload = Data(inputBuffer.dropFirst().prefix(payloadLength))
+                consumeInputBytes(1 + payloadLength)
+                guard let parsed = DeviceIdentityCodec.decode(payload) else {
+                    debugLog("Malformed identity payload — ignoring")
+                    continue
+                }
+                if clientIdentity == nil {
+                    clientIdentity = parsed
+                    debugLog("Client identity: \(parsed.id) (\(parsed.name.isEmpty ? "unnamed" : parsed.name))")
+                    if startupPrepared {
+                        // Landed after the legacy grace already started the
+                        // stream: this session keeps its settings, the
+                        // tablet's profile applies on its next connection.
+                        debugLog("Identity arrived after startup — profile applies on next connect")
+                    }
                 }
 
             case WireMessage.clientSupportsAudio:
                 // Payload-free opt-in, same convention as types 8 and 9.
-                // Recorded as this exact connection, not a flag, so a type 13
+                // Recorded as this exact connection, not a flag, so a type 16
                 // can never be routed to a later client that did not opt in.
                 consumeInputBytes(1)
                 if audioClient !== connection {
@@ -468,6 +922,16 @@ class StreamingServer {
                 debugLog("Unknown client input type: \(msgType)")
                 consumeInputBytes(1)
             }
+        }
+    }
+
+    /// Finish a startup that onPrepareForClient held. Safe to call from any
+    /// thread, and a no-op if that client has gone in the meantime.
+    func resumeProtocolStartup() {
+        networkQueue.async { [weak self] in
+            guard let self = self, self.startupHeld, let conn = self.connection else { return }
+            self.startupHeld = false
+            self.finishProtocolStartup(on: conn)
         }
     }
 
@@ -537,16 +1001,16 @@ class StreamingServer {
         // while handleConnection rewrites `connection` and the capability state
         // as plain stores with no release fence. A reader can therefore observe
         // the NEW connection alongside the previous client's stale flags, and a
-        // stale `true` would emit type 13 to a client that never sent type 12 —
+        // stale `true` would emit type 16 to a client that never sent type 15 —
         // which disconnects it. Requiring `connection === audioClient` fails
         // closed instead: a stale audioClient cannot match the new connection,
-        // so type 13 only ever reaches the exact connection that opted in.
+        // so type 16 only ever reaches the exact connection that opted in.
         guard let connection = connection, !isStopped, connectionReady else {
             noteAudioDrop("no ready connection")
             return
         }
         guard connection === audioClient else {
-            noteAudioDrop("client has not opted in (no type 12)")
+            noteAudioDrop("client has not opted in (no type 15)")
             return
         }
         guard !pcm.isEmpty else {

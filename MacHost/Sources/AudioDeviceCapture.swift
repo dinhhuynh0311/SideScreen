@@ -9,7 +9,7 @@ import Foundation
 /// How the pieces fit: the user installs a loopback driver, selects it as the
 /// Mac's output (directly, or inside a Multi-Output Device to keep hearing the
 /// Mac too), and we capture the loopback's *input* side here. Everything
-/// downstream — the wire format, wire type 13, and the Android AudioPlayer — is
+/// downstream — the wire format, wire type 16, and the Android AudioPlayer — is
 /// unchanged from the ScreenCaptureKit tap path.
 ///
 /// ponytail: an AVCaptureSession rather than a hand-rolled AUHAL input unit.

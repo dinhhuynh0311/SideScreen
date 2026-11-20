@@ -72,8 +72,11 @@ struct VisualEffectBlur: NSViewRepresentable {
 
 struct SettingsView: View {
     @ObservedObject var settings: DisplaySettings
+    @ObservedObject var updater = AppUpdater.shared
     @State private var showPermissionAlert = false
     @State private var showResetConfirmation = false
+    @State private var showAbout = false
+    @State private var showAboutFromLogo = false
     @State private var headerHovered = false
     // Plain strings for the custom resolution fields: TextField(value:format:)
     // only commits on Return/focus-loss, so clicking Apply read stale values,
@@ -97,33 +100,57 @@ struct SettingsView: View {
             VStack(spacing: 0) {
                 // Header with frosted glass
                 HStack(spacing: 14) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 12, style: .continuous)
-                            .fill(LinearGradient(
-                                colors: [Color.accentColor, Color.accentColor.opacity(0.7)],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            ))
-                            .frame(width: 48, height: 48)
-                            .shadow(color: Color.accentColor.opacity(0.3), radius: 8, y: 4)
-
-                        Image(systemName: "rectangle.on.rectangle")
-                            .font(.system(size: 22, weight: .medium))
-                            .foregroundColor(.white)
+                    // Logo: clicking it opens About, same as the ⓘ button.
+                    Button(action: { showAboutFromLogo.toggle() }) {
+                        Image(nsImage: NSApp.applicationIconImage)
+                            .resizable()
+                            .interpolation(.high)
+                            .frame(width: 56, height: 56)
+                            .clipShape(RoundedRectangle(cornerRadius: 13, style: .continuous))
+                            .shadow(color: Color.black.opacity(0.25), radius: 8, y: 4)
+                            .scaleEffect(headerHovered ? 1.05 : 1)
                     }
-                    .scaleEffect(headerHovered ? 1.05 : 1)
+                    .buttonStyle(.plain)
+                    .help("About Side Screen")
                     .animation(.spring(response: 0.3), value: headerHovered)
                     .onHover { headerHovered = $0 }
+                    .popover(isPresented: $showAboutFromLogo, arrowEdge: .bottom) {
+                        AboutPopover(updater: updater)
+                    }
 
                     VStack(alignment: .leading, spacing: 3) {
-                        Text("Side Screen")
-                            .font(.system(size: 20, weight: .bold, design: .rounded))
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text("Side Screen")
+                                .font(.system(size: 20, weight: .bold, design: .rounded))
+                            Text("v\(AppInfo.version)")
+                                .font(.system(size: 11, weight: .semibold, design: .rounded))
+                                .foregroundColor(.secondary)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background { Capsule().fill(.ultraThinMaterial) }
+                        }
                         Text("Turn your tablet into a second display")
                             .font(.system(size: 12, weight: .medium))
                             .foregroundColor(.secondary)
                     }
 
                     Spacer()
+
+                    Button(action: { showAbout.toggle() }) {
+                        Image(systemName: "info")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundColor(.secondary)
+                            .frame(width: 28, height: 28)
+                            .background {
+                                Circle().fill(.ultraThinMaterial)
+                            }
+                    }
+                    .buttonStyle(.plain)
+                    .help("About Side Screen")
+                    .accessibilityLabel("About Side Screen")
+                    .popover(isPresented: $showAbout, arrowEdge: .bottom) {
+                        AboutPopover(updater: updater)
+                    }
 
                     Button(action: { showResetConfirmation = true }) {
                         Image(systemName: "arrow.counterclockwise")
@@ -485,6 +512,10 @@ struct SettingsView: View {
                                     Text("High refresh rate for smooth experience")
                                         .font(.system(size: 10))
                                         .foregroundColor(.green)
+                                } else if ![30, 60].contains(settings.refreshRate) {
+                                    Text("Custom rate — handy when a tablet shows artifacts above a certain FPS")
+                                        .font(.system(size: 10))
+                                        .foregroundColor(.secondary)
                                 }
                             }
                         }
@@ -894,6 +925,34 @@ struct SettingsView: View {
                                     .cornerRadius(8)
                                 }
 
+                                if !settings.displaysHaveSeparateSpaces {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        HStack(spacing: 6) {
+                                            Image(systemName: "exclamationmark.triangle.fill")
+                                                .foregroundColor(.orange)
+                                            Text("Tablet goes black in fullscreen apps")
+                                                .font(.system(size: 12, weight: .medium))
+                                        }
+                                        Text("\"Displays have separate Spaces\" is turned off, so macOS blanks every other display — including the tablet — whenever an app enters fullscreen. Turn it on in System Settings → Desktop & Dock → Mission Control, then log out and back in.")
+                                            .font(.system(size: 11))
+                                            .foregroundColor(.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                        Button(action: {
+                                            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.Desktop-Settings.extension")!)
+                                        }) {
+                                            HStack {
+                                                Image(systemName: "gear")
+                                                Text("Open System Settings")
+                                            }
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        .controlSize(.small)
+                                    }
+                                    .padding(10)
+                                    .background(Color.orange.opacity(0.1))
+                                    .cornerRadius(8)
+                                }
+
                                 if !settings.hasAccessibilityPermission {
                                     VStack(alignment: .leading, spacing: 8) {
                                         HStack(spacing: 6) {
@@ -948,6 +1007,7 @@ struct SettingsView: View {
                                 }
                             }
                         }
+
                     }
                     .padding(20)
                 }
@@ -1072,6 +1132,71 @@ struct SettingsView: View {
 }
 
 // MARK: - Supporting Views
+
+/// Header ⓘ popover: version, what the app is, links, support, credits.
+struct AboutPopover: View {
+    @ObservedObject var updater: AppUpdater
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .frame(width: 44, height: 44)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Side Screen")
+                        .font(.system(size: 15, weight: .semibold))
+                    Text("Version \(AppInfo.version)")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Button("Check for Updates…") {
+                    AppUpdater.shared.checkForUpdates(nil)
+                }
+                .disabled(!updater.canCheckForUpdates)
+                .help(updater.canCheckForUpdates
+                      ? "Look for a newer version now. Side Screen also checks once a day."
+                      : "Update checks are only available in the released build.")
+            }
+
+            Text("Turns an Android tablet or phone into a second display for your Mac — over USB or Wi‑Fi, with touch control. Free and open source.")
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            // Justified: first link flush left, last flush right, equal gaps between.
+            HStack(spacing: 0) {
+                Link("Website", destination: AppInfo.website)
+                Spacer()
+                Link("GitHub", destination: AppInfo.github)
+                Spacer()
+                Link("What's New", destination: AppInfo.changelog)
+                Spacer()
+                Link("Report a Problem", destination: AppInfo.reportProblem)
+            }
+            .font(.system(size: 12))
+
+            Divider()
+
+            Text("If you find Side Screen useful, [support the developer](https://sidescreen.dev/donate.html) — it keeps me motivated to build more useful things.")
+                .font(.system(size: 12))
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 4) {
+                Spacer()
+                Text("Developed by Tran Vuong Quoc Dat with")
+                Image(systemName: "heart.fill")
+                    .foregroundColor(.red)
+                Spacer()
+            }
+            .font(.system(size: 11))
+            .foregroundColor(.secondary)
+        }
+        .padding(16)
+        .frame(width: 400)
+    }
+}
 
 struct StatusRow: View {
     let title: String
@@ -1317,8 +1442,17 @@ class DisplaySettings: ObservableObject {
     /// Device name of the wireless client currently streaming (nil when none).
     /// WirelessSection reads this to show a "Connected" badge on the matching row.
     @Published var currentWirelessDevice: String?
+    /// One-time wireless pairing code (issue #35). Non-nil only while the
+    /// server is running in wireless mode; never persisted.
+    @Published var pairingCode: String?
     @Published var hasScreenRecordingPermission = false
     @Published var hasAccessibilityPermission = false
+    /// Mirrors `NSScreen.screensHaveSeparateSpaces`. When the user has turned
+    /// off "Displays have separate Spaces", macOS blanks every other display
+    /// (including our virtual one) whenever any app goes fullscreen — the
+    /// tablet shows black while the stream keeps flowing (issue #50). The
+    /// setting only takes effect after logout, so this is a per-session fact.
+    @Published var displaysHaveSeparateSpaces = true
     @Published var adbInstalled = false
     @Published var adbReverseConfigured = false
     @Published var usbDeviceConnected = false
@@ -1368,6 +1502,48 @@ class DisplaySettings: ObservableObject {
         defaults.set(value, forKey: keyPrefix + key)
     }
 
+    /// The tablet-specific slice of the settings, plus the display position
+    /// VirtualDisplayManager last saved (same `SideScreen_` keys).
+    var profileSettings: ProfileSettings {
+        let hasPosition = defaults.bool(forKey: keyPrefix + "hasPosition")
+        return ProfileSettings(
+            resolution: resolution,
+            refreshRate: refreshRate,
+            hiDPI: hiDPI,
+            rotation: rotation,
+            flipHorizontal: flipHorizontal,
+            flipVertical: flipVertical,
+            bitrate: bitrate,
+            quality: quality,
+            gamingBoost: gamingBoost,
+            touchEnabled: touchEnabled,
+            positionX: hasPosition ? defaults.integer(forKey: keyPrefix + "positionX") : nil,
+            positionY: hasPosition ? defaults.integer(forKey: keyPrefix + "positionY") : nil
+        )
+    }
+
+    /// Make `profile` the current settings. Only changed values are assigned,
+    /// so observers fire just for what actually differs.
+    func apply(_ profile: ProfileSettings) {
+        if resolution != profile.resolution { resolution = profile.resolution }
+        if refreshRate != profile.refreshRate { refreshRate = profile.refreshRate }
+        if hiDPI != profile.hiDPI { hiDPI = profile.hiDPI }
+        if rotation != profile.rotation { rotation = profile.rotation }
+        if flipHorizontal != profile.flipHorizontal { flipHorizontal = profile.flipHorizontal }
+        if flipVertical != profile.flipVertical { flipVertical = profile.flipVertical }
+        if bitrate != profile.bitrate { bitrate = profile.bitrate }
+        if quality != profile.quality { quality = profile.quality }
+        if gamingBoost != profile.gamingBoost { gamingBoost = profile.gamingBoost }
+        if touchEnabled != profile.touchEnabled { touchEnabled = profile.touchEnabled }
+        if let x = profile.positionX, let y = profile.positionY {
+            save("positionX", x)
+            save("positionY", y)
+            save("hasPosition", true)
+        } else {
+            defaults.removeObject(forKey: keyPrefix + "hasPosition")
+        }
+    }
+
     struct ResolutionGroup: Identifiable {
         let id = UUID()
         let name: String
@@ -1383,7 +1559,7 @@ class DisplaySettings: ObservableObject {
             "1400x920"
         ]),
         ResolutionGroup(name: "16:10", ratio: "Widescreen", resolutions: [
-            "1280x800", "1440x900", "1680x1050", "1920x1200", "2560x1600"
+            "1280x800", "1440x900", "1680x1050", "1920x1200", "2304x1440", "2560x1600"
         ]),
         ResolutionGroup(name: "16:9", ratio: "HD/4K", resolutions: [
             "1280x720", "1366x768", "1600x900", "1920x1080", "2560x1440", "3840x2160"
@@ -1605,6 +1781,25 @@ struct WirelessSection: View {
                     Text(LANAddressResolver.primaryIPv4().map { "Listening: \($0):\(settings.port)" } ?? "WiFi disconnected — no LAN address")
                         .font(.system(size: 10, design: .monospaced))
                         .foregroundColor(.secondary)
+                    if let code = settings.pairingCode {
+                        HStack(spacing: 10) {
+                            VStack { Divider() }
+                            Text("No camera on your tablet?")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                                .fixedSize()
+                            VStack { Divider() }
+                        }
+                        .padding(.top, 8)
+                        Text(PairingCode.display(code))
+                            .font(.system(size: 28, weight: .bold, design: .monospaced))
+                            .kerning(3)
+                            .textSelection(.enabled)
+                        Text("Type this one-time code in the Android app instead.\nA new code is issued after each pairing.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
                 }
                 .frame(maxWidth: .infinity)
             }

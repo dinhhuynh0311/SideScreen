@@ -53,6 +53,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var settingsWindow: SettingsWindowController?
     var statusItem: NSStatusItem?
     let pairedDeviceStore = PairedDeviceStore()
+    let deviceProfileStore = DeviceProfileStore()
+    /// Profile key of the tablet currently streaming (nil when none, or when
+    /// it is an older USB app that does not identify itself).
+    private var activeProfileKey: String?
+    /// True while prepareProfile copies a profile into `settings` and rebuilds
+    /// the display: the observers that would restart the server or push a
+    /// display config early stand down, the switch does that work itself.
+    private var isSwitchingProfile = false
     /// Name of the wireless device currently streaming (nil when no wireless client is active).
     /// Used to roll its `lastConnected` timestamp forward every status refresh tick so the UI
     /// shows "just now" while connected and freezes at the disconnect moment afterward.
@@ -67,10 +75,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let audioMuteQueue = DispatchQueue(label: "com.sidescreen.audioMute", qos: .utility)
     /// Non-nil only while capturing from a loopback device instead of the SCK tap.
     private var audioDeviceCapture: AudioDeviceCapture?
-
-    /// Effective refresh rate the running pipeline was built with, so the
-    /// refresh-rate observer can skip restarts that would change nothing.
-    private var lastAppliedRefreshRate: Int?
     /// Mute state before we changed it. nil means we could not read it — see
     /// `didMuteMac`, which is what actually decides whether we restore.
     private var previousMacMuteState: Bool?
@@ -86,6 +90,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// item, auto-start racing a manual click) must not build a second virtual
     /// display / server. Main-actor confined.
     private var isStartingServer = false
+    /// The effective refresh rate the running pipeline was built with — lets
+    /// the refresh-rate observer skip restarts that would change nothing.
+    private var lastAppliedRefreshRate: Int?
     var isDaemonMode = false // Deprecated: keeping variable for ABI compatibility but unused
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -157,6 +164,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.wifiConnected = StatusDetector.wifiReachable()
         settings.listeningAddress = LANAddressResolver.primaryIPv4()
 
+        // "Displays have separate Spaces" off → any fullscreen app blanks the
+        // virtual display (#50). Nothing we can do about it from capture side;
+        // surface it so the user knows why the tablet went black.
+        let separateSpaces = NSScreen.screensHaveSeparateSpaces
+        if separateSpaces != settings.displaysHaveSeparateSpaces {
+            settings.displaysHaveSeparateSpaces = separateSpaces
+            if !separateSpaces {
+                debugLog("WARNING: 'Displays have separate Spaces' is OFF — fullscreen apps on the Mac will blank the tablet (#50)")
+            }
+        }
+
         // While a wireless client is actively streaming, keep its lastConnected
         // rolling forward so the UI shows "just now". On disconnect, the
         // onClientDisconnected handler clears currentWirelessDevice — from that
@@ -169,7 +187,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let port = Int(settings.port)
         Task.detached { [weak self] in
             let devices = StatusDetector.usbDevices()
-            let reverseOK = StatusDetector.adbReverseConfigured(port: port)
+            // Every attached device needs its own reverse (see setupADBReverse).
+            let reverseOK = !devices.isEmpty
+                && devices.allSatisfy { StatusDetector.adbReverseConfigured(port: port, serial: $0) }
             await MainActor.run { [weak self] in
                 guard let self = self else { return }
                 
@@ -251,7 +271,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Publishers.CombineLatest3(settings.$rotation, settings.$flipHorizontal, settings.$flipVertical)
             .dropFirst()
             .sink { [weak self] rotation, flipHorizontal, flipVertical in
-                guard let self = self, self.settings.isRunning else { return }
+                // A profile switch sends the config itself, once the codec is known.
+                guard let self = self, self.settings.isRunning, !self.isSwitchingProfile else { return }
                 print("🔄 Display transform changed: \(rotation)°, h=\(flipHorizontal), v=\(flipVertical)")
                 self.streamingServer?.updateDisplayTransform(rotation: rotation, flipHorizontal: flipHorizontal, flipVertical: flipVertical)
             }
@@ -285,15 +306,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .dropFirst()
             .removeDuplicates()
             .sink { [weak self] resolution in
-                self?.restartRunningServer(reason: "Resolution changed to \(resolution)")
+                guard let self = self, !self.isSwitchingProfile else { return }
+                self.restartRunningServer(reason: "Resolution changed to \(resolution)")
             }
             .store(in: &cancellables)
 
-        // Refresh rate shapes the virtual display mode AND the capture interval,
-        // so it needs the same rebuild as a resolution change. Debounced because
-        // the custom-FPS slider emits continuously while dragging; the
-        // effective-rate guard then skips restarts that would change nothing (a
-        // drag ending back on the applied value, or Gaming Boost pinning 120).
+        // Refresh rate shapes the virtual display mode AND the capture
+        // interval, so it needs the same rebuild as a resolution change.
+        // Debounced: the custom-FPS slider (issue #41) emits continuously
+        // while dragging — restart once the value settles. The effective-rate
+        // guard skips no-op restarts (drag ends back on the applied value, or
+        // Gaming Boost is pinning the rate to 120).
         settings.$refreshRate
             .dropFirst()
             .removeDuplicates()
@@ -350,6 +373,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
             .store(in: &cancellables)
+
+        // Every settings change lands in the profile it belongs to (see
+        // syncCurrentProfile). objectWillChange fires before the new value is
+        // stored; the debounce reads it after.
+        settings.objectWillChange
+            .debounce(for: .milliseconds(300), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.syncCurrentProfile()
+            }
+            .store(in: &cancellables)
+    }
+
+    /// Stop-and-restart the server to rebuild the virtual display and capture
+    /// pipeline. No-op while stopped.
+    private func restartRunningServer(reason: String) {
+        Task { @MainActor in
+            guard self.settings.isRunning else { return }
+            debugLog("\(reason) — restarting server to rebuild virtual display")
+            self.stopServer()
+            await self.startServer()
+        }
     }
 
     func setupMenuBar() {
@@ -478,89 +522,69 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         debugLog("🔌 setupADBReverse() invoked for port \(port)...")
 
         await Task.detached(priority: .utility) {
-            // Try common adb paths
-            let adbPaths = [
-                "/usr/local/bin/adb",
-                "/opt/homebrew/bin/adb",
-                "~/Library/Android/sdk/platform-tools/adb",
-                "/Users/\(NSUserName())/Library/Android/sdk/platform-tools/adb"
-            ]
-
-            var adbPath: String?
-            for path in adbPaths {
-                let expandedPath = NSString(string: path).expandingTildeInPath
-                if FileManager.default.fileExists(atPath: expandedPath) {
-                    adbPath = expandedPath
-                    break
-                }
-            }
-
-            // Also try 'which adb' to find it in PATH
-            if adbPath == nil {
-                let whichProcess = Process()
-                whichProcess.executableURL = URL(fileURLWithPath: "/usr/bin/which")
-                whichProcess.arguments = ["adb"]
-                let whichPipe = Pipe()
-                whichProcess.standardOutput = whichPipe
-                whichProcess.standardError = FileHandle.nullDevice
-
-                do {
-                    try whichProcess.run()
-                    whichProcess.waitUntilExit()
-                    let data = whichPipe.fileHandleForReading.readDataToEndOfFile()
-                    if let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                       !path.isEmpty {
-                        adbPath = path
-                    }
-                } catch {
-                    // Ignore
-                }
-            }
-
-            guard let finalAdbPath = adbPath else {
+            guard let adbPath = StatusDetector.adbExecutablePath() else {
                 print("⚠️  ADB not found - USB connection may not work")
                 print("💡 Install Android SDK or run manually: adb reverse tcp:\(port) tcp:\(port)")
                 return
             }
+            print("📱 Found ADB at: \(adbPath)")
 
-            print("📱 Found ADB at: \(finalAdbPath)")
+            // One reverse per attached device: a bare `adb reverse` fails with
+            // "more than one device" as soon as a second tablet is plugged in.
+            // Devices still waiting for USB-debugging authorization are not
+            // listed yet; refreshStatusIndicators re-runs this once they are.
+            let serials = StatusDetector.usbDevices()
+            guard !serials.isEmpty else {
+                print("💡 No authorized Android device found — plug in via USB and allow debugging")
+                return
+            }
+            for serial in serials {
+                if StatusDetector.adbReverseConfigured(port: Int(port), serial: serial) {
+                    debugLog("ADB reverse already configured for \(serial)")
+                    continue
+                }
+                await Self.reverseWithRetry(adbPath: adbPath, serial: serial, port: port)
+            }
+        }.value
+    }
 
-            // Retry adb reverse up to 3 times — handles first-install authorization delay
-            for attempt in 1...3 {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: finalAdbPath)
-                process.arguments = ["reverse", "tcp:\(port)", "tcp:\(port)"]
+    /// `adb -s <serial> reverse tcp:P tcp:P`, retried up to 3 times — handles
+    /// the first-install authorization delay.
+    private static func reverseWithRetry(adbPath: String, serial: String, port: UInt16) async {
+        for attempt in 1...3 {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: adbPath)
+            process.arguments = ["-s", serial, "reverse", "tcp:\(port)", "tcp:\(port)"]
 
-                let pipe = Pipe()
-                process.standardOutput = pipe
-                process.standardError = pipe
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
 
-                do {
-                    try process.run()
-                    process.waitUntilExit()
+            do {
+                try process.run()
+                process.waitUntilExit()
 
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let output = String(data: data, encoding: .utf8) ?? ""
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8) ?? ""
 
-                    if process.terminationStatus == 0 {
-                        print("✅ ADB reverse setup successful: tcp:\(port) -> tcp:\(port)")
-                        return
-                    } else {
-                        print("⚠️  ADB reverse attempt \(attempt)/3 failed: \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
-                        if attempt < 3 {
-                            try? await Task.sleep(nanoseconds: 1_000_000_000)
-                        }
-                    }
-                } catch {
-                    print("⚠️  Failed to run ADB (attempt \(attempt)/3): \(error.localizedDescription)")
+                if process.terminationStatus == 0 {
+                    print("✅ ADB reverse setup successful for \(serial): tcp:\(port) -> tcp:\(port)")
+                    return
+                } else {
+                    print("⚠️  ADB reverse attempt \(attempt)/3 failed for \(serial): \(output.trimmingCharacters(in: .whitespacesAndNewlines))")
                     if attempt < 3 {
                         try? await Task.sleep(nanoseconds: 1_000_000_000)
                     }
                 }
+            } catch {
+                print("⚠️  Failed to run ADB (attempt \(attempt)/3): \(error.localizedDescription)")
+                if attempt < 3 {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
             }
+        }
 
-            print("💡 Make sure Android device is connected via USB with debugging enabled")
-        }.value
+        print("💡 Make sure Android device \(serial) is connected via USB with debugging enabled")
     }
 
     @MainActor
@@ -608,22 +632,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         do {
             // Create virtual display and run ADB setup in parallel
-            virtualDisplayManager = VirtualDisplayManager()
-            let size = settings.resolutionSize
-            try virtualDisplayManager?.createDisplay(
-                width: size.width,
-                height: size.height,
-                refreshRate: settings.refreshRate,
-                hiDPI: settings.hiDPI,
-                name: "SideScreen"
-            )
-
-            // Disable mirror mode (may fail if already in extend mode)
-            do {
-                try virtualDisplayManager?.disableMirrorMode()
-            } catch {
-                // Not critical - continue anyway
-            }
+            let manager = VirtualDisplayManager()
+            virtualDisplayManager = manager
+            try createVirtualDisplay(on: manager)
 
             await MainActor.run {
                 settings.displayCreated = true
@@ -640,36 +651,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 group.addTask { try? await Task.sleep(nanoseconds: 500_000_000) }
             }
 
-            virtualDisplayManager?.restoreDisplayPosition()
-
-            // Verify display is registered in the system
-            if let vdm = virtualDisplayManager {
-                let registered = vdm.verifyDisplayRegistered()
-                if !registered {
-                    debugLog("WARNING: Virtual display not found in online display list — capture may fail")
-                }
-            }
-
-            // Setup capture
-            guard let displayID = virtualDisplayManager?.displayID else { return }
-            screenCapture = try await ScreenCapture()
-            screenCapture?.onCaptureMethodChanged = { [weak self] method in
-                guard let self = self else { return }
-                debugLog("Capture method: \(method)")
-                Task { @MainActor in
-                    self.settings.captureMethod = method
-                }
-            }
-            screenCapture?.onAudioPCM = { [weak self] pcm in
-                self?.streamingServer?.sendAudio(pcm)
-            }
-            // Must precede setupForVirtualDisplay — setupStream() reads this
-            // property while configuring the SCStream, so setting it later is a
-            // silent no-op until the next restart. The SCK tap stays off when a
-            // loopback device is the source, so the two never both feed the wire.
-            screenCapture?.captureAudio = settings.audioEnabled && !settings.usesAudioDeviceSource
-            lastAppliedRefreshRate = settings.effectiveRefreshRate
-            try await screenCapture?.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
+            manager.restoreDisplayPosition()
+            screenCapture = try await makeCapture(for: manager)
             startAudioDeviceCaptureIfSelected()
 
             // Setup server
@@ -677,6 +660,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             streamingServer?.touchEnabled = settings.touchEnabled
             if settings.connectionMode == .wireless {
                 streamingServer?.expectedAuthToken = WirelessAuth.loadOrCreate()
+                configurePairingCode(on: streamingServer)
                 streamingServer?.onWirelessClientPaired = { [weak self] deviceName in
                     guard let self = self else { return }
                     Task { @MainActor in
@@ -686,13 +670,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
             }
-            // Send the LOGICAL resolution that the user picked. The H.264 SPS in
-            // the stream still carries the true physical pixel dimensions, so the
-            // Android decoder/MediaCodec sets up correctly regardless. Sending the
-            // logical dimensions here makes the resolution overlay on Android
-            // match the Mac's resolution dropdown (e.g. "2560x1600" instead of
-            // the HiDPI-doubled "5120x3200").
-            streamingServer?.setDisplaySize(width: size.width, height: size.height, rotation: settings.rotation, flipHorizontal: settings.flipHorizontal, flipVertical: settings.flipVertical)
+            configureDisplayGeometry(on: streamingServer, for: manager)
+            streamingServer?.onPrepareForClient = { [weak self] key, name in
+                guard let self = self, let key = key else { return true }
+                Task { @MainActor in await self.prepareProfile(key: key, name: name) }
+                return false
+            }
             streamingServer?.onClientConnected = { [weak self] in
                 guard let self = self else { return }
                 self.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
@@ -708,15 +691,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // dimensions for the negotiated codec.
             streamingServer?.onCodecNegotiated = { [weak self] codec in
                 guard let self = self, let capture = self.screenCapture else { return }
-                capture.negotiate(codec: codec, clientLimit: self.streamingServer?.clientDecodeLimits)
+                capture.negotiate(
+                    codec: codec,
+                    clientLimit: self.streamingServer?.clientDecodeLimits,
+                    clientLimitTable: self.streamingServer?.clientDecodeLimitTable
+                )
                 let enc = capture.encodeSize(for: codec)
-                // Unclamped HEVC keeps the logical user-picked resolution,
-                // exactly as at startup; any clamped size (client decoder
-                // limit, or the AVC floor) must match what the stream's SPS
-                // will carry so the client sizes its decoder correctly.
-                let unclampedHevc = codec == .hevc && enc == (capture.displayWidth, capture.displayHeight)
-                let (w, h) = unclampedHevc ? (size.width, size.height) : (enc.width, enc.height)
-                self.streamingServer?.setDisplaySize(width: w, height: h, rotation: self.settings.rotation, flipHorizontal: self.settings.flipHorizontal, flipVertical: self.settings.flipVertical)
+                // Whatever the codec negotiation settled on, this is what the
+                // stream's SPS will carry, so it is what the client must size
+                // its decoder for.
+                let desktop = self.settings.resolutionSize
+                self.streamingServer?.setDesktopSize(width: desktop.width, height: desktop.height)
+                self.streamingServer?.setDisplaySize(width: enc.width, height: enc.height, rotation: self.settings.rotation, flipHorizontal: self.settings.flipHorizontal, flipVertical: self.settings.flipVertical)
             }
             streamingServer?.onKeyframeRequested = { [weak self] force in
                 self?.screenCapture?.requestKeyframeOrReplayCachedFrame(force: force)
@@ -733,6 +719,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     // so a reconnect can't have its mute overtaken by the
                     // previous connection's restore.
                     self.requestRestoreMacMuteState()
+                    self.closeActiveProfile()
                     // Final lastConnected snapshot at the disconnect moment, then
                     // freeze (currentWirelessDevice = nil stops the rolling update
                     // in refreshStatusIndicators).
@@ -756,14 +743,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-            streamingServer?.start()
-            screenCapture?.startStreaming(
-                to: streamingServer,
-                bitrateMbps: settings.effectiveBitrate,
-                quality: settings.effectiveQuality,
-                gamingBoost: settings.gamingBoost,
-                frameRate: settings.effectiveRefreshRate
-            )
+            guard let server = streamingServer else {
+                throw NSError(
+                    domain: "SideScreen.Startup",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "The streaming server could not be created."]
+                )
+            }
+            try await server.start()
+            startStreaming(to: server)
 
             // Muting deliberately does NOT happen here: the server outlives the
             // client, so mute is bound to the client's lifetime instead — see
@@ -781,8 +769,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             restoreMacMuteState()
             print("❌ Failed to start: \(error)")
             await MainActor.run {
-                settings.isRunning = false
-                settings.displayCreated = false
+                self.tearDownServerResources(saveDisplayPosition: false)
 
                 let alert = NSAlert()
                 alert.messageText = "Failed to Start Server"
@@ -811,18 +798,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // speakers, so muting on top of it would only silence the tablet too.
         guard !settings.usesAudioDeviceSource else { return }
         requestMuteMac()
-    }
-
-    /// Stop-and-restart the server to rebuild the virtual display and capture
-    /// pipeline. No-op while stopped. Three settings observers needed the exact
-    /// same stop/start dance, and a fourth (refresh rate) was missing entirely.
-    private func restartRunningServer(reason: String) {
-        Task { @MainActor in
-            guard settings.isRunning else { return }
-            debugLog("\(reason) — restarting server to rebuild virtual display")
-            stopServer()
-            await startServer()
-        }
     }
 
     /// Starts loopback-device capture when the settings select one, falling back
@@ -912,11 +887,209 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             + (priorWasUnknown ? " (prior state was unknown)" : ""))
     }
 
-    func stopServer() {
-        restoreMacMuteState()
+    /// Create the virtual display from the current settings, in extend mode.
+    private func createVirtualDisplay(on manager: VirtualDisplayManager) throws {
+        let size = settings.resolutionSize
+        try manager.createDisplay(
+            width: size.width,
+            height: size.height,
+            refreshRate: settings.refreshRate,
+            hiDPI: settings.hiDPI,
+            name: "SideScreen"
+        )
 
-        // Save display position before destroying
+        // Disable mirror mode (may fail if already in extend mode)
+        do {
+            try manager.disableMirrorMode()
+        } catch {
+            // Not critical - continue anyway
+        }
+    }
+
+    /// Capture for `manager`'s display, already positioned.
+    private func makeCapture(for manager: VirtualDisplayManager) async throws -> ScreenCapture {
+        // Verify display is registered in the system
+        if !manager.verifyDisplayRegistered() {
+            debugLog("WARNING: Virtual display not found in online display list — capture may fail")
+        }
+
+        guard let displayID = manager.displayID else {
+            throw NSError(
+                domain: "SideScreen.Startup",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The virtual display was created without a display ID."]
+            )
+        }
+        let capture = try await ScreenCapture()
+        capture.onCaptureMethodChanged = { [weak self] method in
+            guard let self = self else { return }
+            debugLog("Capture method: \(method)")
+            Task { @MainActor in
+                self.settings.captureMethod = method
+            }
+        }
+        capture.onAudioPCM = { [weak self] pcm in
+            self?.streamingServer?.sendAudio(pcm)
+        }
+        // Must precede setupForVirtualDisplay — setupStream() reads this
+        // property while configuring the SCStream, so setting it later is a
+        // silent no-op until the next restart. The SCK tap stays off when a
+        // loopback device is the source, so the two never both feed the wire.
+        capture.captureAudio = settings.audioEnabled && !settings.usesAudioDeviceSource
+        lastAppliedRefreshRate = settings.effectiveRefreshRate
+        try await capture.setupForVirtualDisplay(displayID, refreshRate: settings.effectiveRefreshRate)
+        return capture
+    }
+
+    private func configureDisplayGeometry(on server: StreamingServer?, for manager: VirtualDisplayManager) {
+        guard let displayID = manager.displayID else { return }
+        // displayConfig carries the ENCODED size, always. The client sizes and
+        // selects its decoder from it, so a friendlier number here makes it
+        // check capabilities against a resolution it will never receive. The
+        // logical desktop travels separately, for display only.
+        let size = settings.resolutionSize
+        let initialEncode = ScreenCapture.physicalSize(for: displayID)
+        server?.setDesktopSize(width: size.width, height: size.height)
+        server?.setDisplaySize(width: initialEncode.width, height: initialEncode.height, rotation: settings.rotation, flipHorizontal: settings.flipHorizontal, flipVertical: settings.flipVertical)
+    }
+
+    private func startStreaming(to server: StreamingServer) {
+        screenCapture?.startStreaming(
+            to: server,
+            bitrateMbps: settings.effectiveBitrate,
+            quality: settings.effectiveQuality,
+            gamingBoost: settings.gamingBoost,
+            frameRate: settings.effectiveRefreshRate
+        )
+    }
+
+    // MARK: - Per-tablet profiles
+
+    /// A tablet identified itself and its stream is held until this returns
+    /// it to the server. Its profile is applied first: nothing to do when it
+    /// matches what is running, the display just moves when only the position
+    /// differs, and the display and capture are rebuilt — with the client
+    /// still connected — when anything that shapes them differs. A tablet
+    /// without a profile starts from the current settings, i.e. the last
+    /// profile used.
+    @MainActor
+    private func prepareProfile(key: String, name: String) async {
+        guard let server = streamingServer else { return }
+        defer { server.resumeProtocolStartup() }
+
+        // Flush whatever the current settings belong to (the last tablet, or
+        // one that never disconnected cleanly) before they are replaced.
         virtualDisplayManager?.saveDisplayPosition()
+        syncCurrentProfile()
+
+        let current = settings.profileSettings
+        let stored = deviceProfileStore.profile(id: key)
+        let displayName = name.isEmpty ? (stored?.name ?? "Tablet") : name
+        activeProfileKey = key
+        deviceProfileStore.save(DeviceProfile(id: key, name: displayName, lastConnected: Date(), settings: stored?.settings ?? current))
+
+        guard let target = stored?.settings, target != current else {
+            debugLog("Profile \(displayName): \(stored == nil ? "new tablet, starting from the last profile" : "matches, nothing to apply")")
+            return
+        }
+
+        isSwitchingProfile = true
+        defer { isSwitchingProfile = false }
+        settings.apply(target)
+
+        if target.displayShape != current.displayShape {
+            debugLog("Profile \(displayName): rebuilding display for \(target.resolution) @ \(target.refreshRate)Hz")
+            lastAppliedRefreshRate = settings.effectiveRefreshRate
+            do {
+                try await rebuildDisplay(for: server)
+            } catch {
+                debugLog("❌ Profile switch failed: \(error) — stopping server")
+                stopServer()
+            }
+        } else {
+            debugLog("Profile \(displayName): applied live")
+            if target.positionX != current.positionX || target.positionY != current.positionY {
+                virtualDisplayManager?.restoreDisplayPosition()
+            }
+        }
+    }
+
+    /// Swap the virtual display and capture for ones built from the current
+    /// settings while `server` and its client stay up.
+    @MainActor
+    private func rebuildDisplay(for server: StreamingServer) async throws {
+        guard let manager = virtualDisplayManager else { return }
+        screenCapture?.stopStreaming()
+        screenCapture = nil
+
+        try createVirtualDisplay(on: manager)
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        manager.restoreDisplayPosition()
+        let capture = try await makeCapture(for: manager)
+        guard streamingServer === server else { return }
+        screenCapture = capture
+        configureDisplayGeometry(on: server, for: manager)
+        startStreaming(to: server)
+    }
+
+    /// The streaming tablet went away: keep where its display ended up and
+    /// what it was set to, then stop tracking it.
+    private func closeActiveProfile() {
+        guard activeProfileKey != nil else { return }
+        // Mid-switch the display is a fresh one not yet moved into place.
+        if !isSwitchingProfile {
+            virtualDisplayManager?.saveDisplayPosition()
+        }
+        syncCurrentProfile()
+        activeProfileKey = nil
+    }
+
+    /// Copy the current settings into the profile they belong to: the
+    /// streaming tablet, or — while none is — the one used last, so a change
+    /// made between sessions is not undone when that tablet comes back.
+    private func syncCurrentProfile() {
+        guard let key = activeProfileKey ?? deviceProfileStore.mostRecent()?.id else { return }
+        deviceProfileStore.updateSettings(settings.profileSettings, for: key)
+    }
+
+    /// Code pairing (issue #35): issue a fresh one-time code for this wireless
+    /// session. The server consumes/invalidates the code atomically on its
+    /// network queue (one-time use, 5-attempt budget); these callbacks only
+    /// install the replacement.
+    private func configurePairingCode(on server: StreamingServer?) {
+        guard let server = server else { return }
+        rotatePairingCode(on: server)
+        server.pairingMacName = Host.current().localizedName ?? "Mac"
+        server.onPairingSuccess = { [weak self, weak server] deviceName in
+            guard let self = self else { return }
+            self.rotatePairingCode(on: server)
+            Task { @MainActor in
+                self.pairedDeviceStore.upsert(name: deviceName, lastConnected: Date())
+            }
+        }
+        server.onPairingCodeExhausted = { [weak self, weak server] in
+            debugLog("Pairing attempt budget exhausted — rotating code")
+            self?.rotatePairingCode(on: server)
+        }
+    }
+
+    private func rotatePairingCode(on server: StreamingServer?) {
+        let code = PairingCode.generate()
+        server?.expectedPairingCode = code
+        Task { @MainActor in
+            // A rotation queued just before Stop must not resurrect the code
+            // in the UI after stopServer() cleared it.
+            guard self.settings.isRunning || self.isStartingServer else { return }
+            self.settings.pairingCode = code
+        }
+    }
+
+    private func tearDownServerResources(saveDisplayPosition: Bool) {
+        if saveDisplayPosition {
+            virtualDisplayManager?.saveDisplayPosition()
+        }
+        settings.pairingCode = nil
+        streamingServer?.expectedPairingCode = nil
 
         audioDeviceCapture?.stop()
         audioDeviceCapture = nil
@@ -924,11 +1097,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         streamingServer?.stop()
         virtualDisplayManager?.destroyDisplay()
 
+        screenCapture = nil
+        streamingServer = nil
+        virtualDisplayManager = nil
+        currentWirelessDevice = nil
+
         settings.isRunning = false
         settings.displayCreated = false
         settings.clientConnected = false
+        settings.currentWirelessDevice = nil
         settings.currentFPS = 0
         settings.currentBitrate = 0
+    }
+
+    func stopServer() {
+        restoreMacMuteState()
+        tearDownServerResources(saveDisplayPosition: true)
+        syncCurrentProfile()
+        activeProfileKey = nil
 
         print("⏹️ Server stopped")
     }
