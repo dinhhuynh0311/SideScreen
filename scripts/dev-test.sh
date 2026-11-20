@@ -22,6 +22,10 @@ echo "[2/5] Creating .app bundle..."
 mkdir -p "$APP_DIR/Contents/MacOS"
 mkdir -p "$APP_DIR/Contents/Resources"
 cp .build/release/SideScreen "$APP_DIR/Contents/MacOS/"
+# Sparkle (auto-update) is dynamically linked; without it dyld aborts at launch
+mkdir -p "$APP_DIR/Contents/Frameworks"
+rm -rf "$APP_DIR/Contents/Frameworks/Sparkle.framework"
+cp -R .build/release/Sparkle.framework "$APP_DIR/Contents/Frameworks/"
 
 if [ -f "Resources/AppIcon.icns" ]; then
     cp Resources/AppIcon.icns "$APP_DIR/Contents/Resources/"

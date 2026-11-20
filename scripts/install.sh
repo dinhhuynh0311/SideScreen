@@ -47,6 +47,10 @@ mkdir -p "$APP_DIR/Resources"
 # Copy executable
 cp MacHost/.build/release/SideScreen "$APP_DIR/MacOS/SideScreen"
 
+# Sparkle (auto-update) is dynamically linked; without it dyld aborts at launch
+mkdir -p "$APP_DIR/Frameworks"
+cp -R MacHost/.build/release/Sparkle.framework "$APP_DIR/Frameworks/"
+
 # Create Info.plist
 cat > "$APP_DIR/Info.plist" << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
